@@ -44,10 +44,29 @@ body {
   z-index: 1;
   cursor: grab;
   touch-action: none;
+  overflow: hidden;
+  background: #0d0d1a;
 }
 
 .map-canvas:active {
   cursor: grabbing;
+}
+
+/* Chunk transform layer */
+.map-chunk-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  will-change: transform;
+  image-rendering: pixelated;
+}
+
+/* Individual chunk tiles with CSS opacity transition */
+.map-chunk-tile {
+  position: absolute;
+  background-size: 100% 100%;
+  image-rendering: pixelated;
+  transition: opacity 0.4s ease-in-out;
 }
 
 /* Controls overlay */

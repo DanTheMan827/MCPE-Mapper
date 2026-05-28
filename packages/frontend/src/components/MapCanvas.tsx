@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { ViewerConfig, MapMarker, ChunkRenderData, ChunkCoord } from '@mcpe-mapper/shared';
+import { ViewerConfig, MapMarker, ChunkCoord } from '@mcpe-mapper/shared';
 import { OfflineWorldReader } from '../services/OfflineWorldReader';
 import { BackendService } from '../services/BackendService';
 import { AppMode } from '../App';
@@ -16,6 +16,24 @@ const CHUNK_SIZE = 16;
 const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 32;
 
+/** Converts ImageData to a data URL for use as a CSS background */
+function imageDataToDataURL(imageData: ImageData): string {
+  const canvas = document.createElement('canvas');
+  canvas.width = 16;
+  canvas.height = 16;
+  const ctx = canvas.getContext('2d')!;
+  ctx.putImageData(imageData, 0, 0);
+  return canvas.toDataURL();
+}
+
+interface ChunkTile {
+  key: string;
+  x: number;
+  z: number;
+  dataUrl: string;
+  visible: boolean;
+}
+
 export const MapCanvas: React.FC<MapCanvasProps> = ({
   mode,
   config,
@@ -23,33 +41,29 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   backendService,
   markers,
 }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const [viewState, setViewState] = useState({
     offsetX: 0,
     offsetY: 0,
     zoom: 2,
   });
+  const [chunkTiles, setChunkTiles] = useState<Map<string, ChunkTile>>(new Map());
   const renderedChunks = useRef<Map<string, ImageData>>(new Map());
-  /** Tracks when each chunk was added for fade-in animation */
-  const chunkLoadTime = useRef<Map<string, number>>(new Map());
   const pendingChunks = useRef<Set<string>>(new Set());
   /** Tracks chunks that returned no data so we don't re-request them */
   const emptyChunks = useRef<Set<string>>(new Set());
   const isDragging = useRef(false);
   const lastPointer = useRef({ x: 0, y: 0 });
   const pinchDistance = useRef<number | null>(null);
-  const animFrameRef = useRef<number>(0);
-  /** Duration in ms for chunk fade-in */
-  const FADE_DURATION = 400;
 
   // Load chunks that are visible
   const loadVisibleChunks = useCallback(async () => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const container = containerRef.current;
+    if (!container) return;
 
     const { offsetX, offsetY, zoom } = viewState;
-    const width = canvas.width;
-    const height = canvas.height;
+    const width = container.clientWidth;
+    const height = container.clientHeight;
 
     // Calculate visible chunk range
     const pixelSize = CHUNK_SIZE * zoom;
@@ -74,8 +88,9 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
 
     if (chunksToLoad.length === 0) return;
 
+    const newTiles = new Map(chunkTiles);
+
     if (mode === 'offline' && offlineReader) {
-      // Load chunks from offline reader
       for (const coord of chunksToLoad) {
         const chunkData = offlineReader.getChunkRender(
           coord.x,
@@ -91,15 +106,14 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
             16
           );
           renderedChunks.current.set(key, imageData);
-          chunkLoadTime.current.set(key, performance.now());
+          const dataUrl = imageDataToDataURL(imageData);
+          newTiles.set(key, { key, x: coord.x, z: coord.z, dataUrl, visible: false });
         } else {
-          // Mark as empty so we don't re-request it
           emptyChunks.current.add(key);
         }
         pendingChunks.current.delete(key);
       }
     } else if (mode === 'backend' && backendService) {
-      // Load chunks from backend in batches
       const batchSize = 32;
       for (let i = 0; i < chunksToLoad.length; i += batchSize) {
         const batch = chunksToLoad.slice(i, i + batchSize);
@@ -110,7 +124,6 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
             config.heightRange
           );
 
-          // Track which chunks actually returned data
           const returnedKeys = new Set<string>();
           for (const chunkData of chunkDataList) {
             const key = `${chunkData.x},${chunkData.z},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
@@ -120,12 +133,12 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
               16
             );
             renderedChunks.current.set(key, imageData);
-            chunkLoadTime.current.set(key, performance.now());
+            const dataUrl = imageDataToDataURL(imageData);
+            newTiles.set(key, { key, x: chunkData.x, z: chunkData.z, dataUrl, visible: false });
             pendingChunks.current.delete(key);
             returnedKeys.add(key);
           }
 
-          // Mark chunks that weren't returned as empty
           for (const coord of batch) {
             const key = `${coord.x},${coord.z},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
             if (!returnedKeys.has(key)) {
@@ -135,7 +148,6 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
           }
         } catch (err) {
           console.error('Failed to load chunks:', err);
-          // Clear pending state so they can be retried on network error
           for (const coord of batch) {
             const key = `${coord.x},${coord.z},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
             pendingChunks.current.delete(key);
@@ -143,14 +155,29 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
         }
       }
     }
-  }, [mode, offlineReader, backendService, config, viewState]);
+
+    setChunkTiles(newTiles);
+
+    // Trigger CSS transition: set visible to true after a frame
+    requestAnimationFrame(() => {
+      setChunkTiles(prev => {
+        const updated = new Map(prev);
+        for (const [key, tile] of updated) {
+          if (!tile.visible) {
+            updated.set(key, { ...tile, visible: true });
+          }
+        }
+        return updated;
+      });
+    });
+  }, [mode, offlineReader, backendService, config, viewState, chunkTiles]);
 
   // Clear cache when config changes
   useEffect(() => {
     renderedChunks.current.clear();
     pendingChunks.current.clear();
     emptyChunks.current.clear();
-    chunkLoadTime.current.clear();
+    setChunkTiles(new Map());
   }, [config.dimension, config.heightRange.min, config.heightRange.max]);
 
   // Subscribe to WebSocket chunk updates to invalidate specific cached chunks
@@ -158,9 +185,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     if (mode !== 'backend' || !backendService) return;
 
     const unsubscribe = backendService.onChunkUpdate((updatedCoords) => {
-      // Only invalidate the specific chunks that were updated
       for (const coord of updatedCoords) {
-        // Remove from all caches with any height range (since data changed)
         const prefix = `${coord.x},${coord.z},`;
         for (const key of renderedChunks.current.keys()) {
           if (key.startsWith(prefix)) {
@@ -172,122 +197,20 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
             emptyChunks.current.delete(key);
           }
         }
+        setChunkTiles(prev => {
+          const updated = new Map(prev);
+          for (const key of updated.keys()) {
+            if (key.startsWith(prefix)) {
+              updated.delete(key);
+            }
+          }
+          return updated;
+        });
       }
     });
 
     return unsubscribe;
   }, [mode, backendService]);
-
-  // Render loop
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const render = () => {
-      const { offsetX, offsetY, zoom } = viewState;
-      const width = canvas.width;
-      const height = canvas.height;
-
-      // Clear
-      ctx.fillStyle = '#0d0d1a';
-      ctx.fillRect(0, 0, width, height);
-
-      // Save state
-      ctx.save();
-      ctx.translate(width / 2 + offsetX, height / 2 + offsetY);
-      ctx.scale(zoom, zoom);
-
-      // Draw grid
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.03)';
-      ctx.lineWidth = 1 / zoom;
-
-      const pixelSize = CHUNK_SIZE;
-      const startChunkX = Math.floor((-offsetX / zoom - width / 2 / zoom) / pixelSize) - 1;
-      const endChunkX = Math.ceil((-offsetX / zoom + width / 2 / zoom) / pixelSize) + 1;
-      const startChunkZ = Math.floor((-offsetY / zoom - height / 2 / zoom) / pixelSize) - 1;
-      const endChunkZ = Math.ceil((-offsetY / zoom + height / 2 / zoom) / pixelSize) + 1;
-
-      // Draw rendered chunks with fade-in
-      ctx.imageSmoothingEnabled = false;
-      const now = performance.now();
-      let hasAnimatingChunks = false;
-
-      for (let cx = startChunkX; cx <= endChunkX; cx++) {
-        for (let cz = startChunkZ; cz <= endChunkZ; cz++) {
-          const key = `${cx},${cz},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
-          const imageData = renderedChunks.current.get(key);
-          if (imageData) {
-            // Calculate opacity based on time since chunk was loaded
-            const loadedAt = chunkLoadTime.current.get(key) || 0;
-            const elapsed = now - loadedAt;
-            const opacity = Math.min(1, elapsed / FADE_DURATION);
-
-            if (opacity < 1) hasAnimatingChunks = true;
-
-            ctx.globalAlpha = opacity;
-
-            // Create a temporary canvas to draw ImageData
-            const tmpCanvas = document.createElement('canvas');
-            tmpCanvas.width = 16;
-            tmpCanvas.height = 16;
-            const tmpCtx = tmpCanvas.getContext('2d')!;
-            tmpCtx.putImageData(imageData, 0, 0);
-            ctx.drawImage(tmpCanvas, cx * 16, cz * 16, 16, 16);
-          }
-        }
-      }
-
-      // Reset alpha for markers
-      ctx.globalAlpha = 1;
-
-      // Draw markers
-      for (const marker of markers) {
-        const mx = marker.x;
-        const mz = marker.z;
-
-        ctx.save();
-        ctx.translate(mx, mz);
-
-        const markerSize = 4 / zoom;
-
-        if (marker.type === 'player') {
-          ctx.fillStyle = '#4fc3f7';
-        } else if (marker.type === 'nether_portal') {
-          ctx.fillStyle = '#9c27b0';
-        } else {
-          ctx.fillStyle = '#66bb6a';
-        }
-
-        ctx.beginPath();
-        ctx.arc(0, 0, markerSize, 0, Math.PI * 2);
-        ctx.fill();
-
-        // Border
-        ctx.strokeStyle = 'white';
-        ctx.lineWidth = 1 / zoom;
-        ctx.stroke();
-
-        // Label
-        const fontSize = Math.max(8, 12 / zoom);
-        ctx.font = `${fontSize}px sans-serif`;
-        ctx.fillStyle = 'white';
-        ctx.textAlign = 'center';
-        ctx.fillText(marker.label, 0, -markerSize - 4 / zoom);
-
-        ctx.restore();
-      }
-
-      ctx.restore();
-
-      animFrameRef.current = requestAnimationFrame(render);
-    };
-
-    animFrameRef.current = requestAnimationFrame(render);
-    return () => cancelAnimationFrame(animFrameRef.current);
-  }, [viewState, config, markers]);
 
   // Load chunks when view changes
   useEffect(() => {
@@ -295,22 +218,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       loadVisibleChunks();
     }, 100);
     return () => clearTimeout(timer);
-  }, [loadVisibleChunks]);
-
-  // Resize handler
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const resize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
-    };
-
-    resize();
-    window.addEventListener('resize', resize);
-    return () => window.removeEventListener('resize', resize);
-  }, []);
+  }, [viewState, config, mode]);
 
   // Mouse/touch handlers
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
@@ -338,15 +246,16 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
     const delta = -e.deltaY * 0.001;
+    const container = containerRef.current;
+    if (!container) return;
+
     setViewState(prev => {
       const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, prev.zoom * (1 + delta)));
       const zoomRatio = newZoom / prev.zoom;
 
-      // Zoom toward cursor position
-      const canvas = canvasRef.current!;
-      const rect = canvas.getBoundingClientRect();
-      const mx = e.clientX - rect.left - canvas.width / 2;
-      const my = e.clientY - rect.top - canvas.height / 2;
+      const rect = container.getBoundingClientRect();
+      const mx = e.clientX - rect.left - container.clientWidth / 2;
+      const my = e.clientY - rect.top - container.clientHeight / 2;
 
       return {
         zoom: newZoom,
@@ -384,9 +293,11 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     pinchDistance.current = null;
   }, []);
 
+  const { offsetX, offsetY, zoom } = viewState;
+
   return (
-    <canvas
-      ref={canvasRef}
+    <div
+      ref={containerRef}
       className="map-canvas"
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
@@ -396,6 +307,45 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
-    />
+    >
+      {/* Chunk layer */}
+      <div
+        className="map-chunk-layer"
+        style={{
+          transform: `translate(${offsetX + (containerRef.current?.clientWidth || 0) / 2}px, ${offsetY + (containerRef.current?.clientHeight || 0) / 2}px) scale(${zoom})`,
+          transformOrigin: '0 0',
+        }}
+      >
+        {Array.from(chunkTiles.values()).map(tile => (
+          <div
+            key={tile.key}
+            className="map-chunk-tile"
+            style={{
+              left: tile.x * CHUNK_SIZE,
+              top: tile.z * CHUNK_SIZE,
+              width: CHUNK_SIZE,
+              height: CHUNK_SIZE,
+              backgroundImage: `url(${tile.dataUrl})`,
+              opacity: tile.visible ? 1 : 0,
+            }}
+          />
+        ))}
+
+        {/* Markers */}
+        {markers.map(marker => (
+          <div
+            key={marker.id}
+            className="map-marker"
+            style={{
+              left: marker.x,
+              top: marker.z,
+            }}
+          >
+            <div className={`marker-dot ${marker.type}`} />
+            <div className="marker-label">{marker.label}</div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 };

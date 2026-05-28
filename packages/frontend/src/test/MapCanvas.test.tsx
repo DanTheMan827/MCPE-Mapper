@@ -3,30 +3,12 @@ import { render } from '@testing-library/react';
 import { MapCanvas } from '../components/MapCanvas';
 import { ViewerConfig } from '@mcpe-mapper/shared';
 
-// Mock canvas context
-const mockContext = {
-  fillRect: vi.fn(),
-  fillStyle: '',
-  strokeStyle: '',
-  lineWidth: 0,
-  save: vi.fn(),
-  restore: vi.fn(),
-  translate: vi.fn(),
-  scale: vi.fn(),
-  beginPath: vi.fn(),
-  arc: vi.fn(),
-  fill: vi.fn(),
-  stroke: vi.fn(),
-  fillText: vi.fn(),
-  font: '',
-  textAlign: '',
-  imageSmoothingEnabled: true,
-  drawImage: vi.fn(),
-  putImageData: vi.fn(),
-};
-
+// Mock canvas for data URL generation
 beforeEach(() => {
-  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(mockContext as any);
+  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
+    putImageData: vi.fn(),
+  } as any);
+  vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,mock');
 });
 
 const mockConfig: ViewerConfig = {
@@ -38,7 +20,7 @@ const mockConfig: ViewerConfig = {
 };
 
 describe('MapCanvas', () => {
-  it('renders a canvas element', () => {
+  it('renders a container div element', () => {
     const { container } = render(
       <MapCanvas
         mode="offline"
@@ -48,8 +30,8 @@ describe('MapCanvas', () => {
         markers={[]}
       />
     );
-    const canvas = container.querySelector('canvas');
-    expect(canvas).toBeInTheDocument();
+    const mapDiv = container.querySelector('.map-canvas');
+    expect(mapDiv).toBeInTheDocument();
   });
 
   it('has map-canvas class', () => {
@@ -62,11 +44,11 @@ describe('MapCanvas', () => {
         markers={[]}
       />
     );
-    const canvas = container.querySelector('canvas');
-    expect(canvas).toHaveClass('map-canvas');
+    const mapDiv = container.querySelector('.map-canvas');
+    expect(mapDiv).toHaveClass('map-canvas');
   });
 
-  it('renders with touch-action none for gesture support', () => {
+  it('contains a chunk layer', () => {
     const { container } = render(
       <MapCanvas
         mode="offline"
@@ -76,12 +58,11 @@ describe('MapCanvas', () => {
         markers={[]}
       />
     );
-    // The canvas element should exist and respond to pointer events
-    const canvas = container.querySelector('canvas');
-    expect(canvas).toBeTruthy();
+    const chunkLayer = container.querySelector('.map-chunk-layer');
+    expect(chunkLayer).toBeInTheDocument();
   });
 
-  it('renders markers when provided', () => {
+  it('renders markers as DOM elements when provided', () => {
     const markers = [
       { id: '1', x: 0, y: 64, z: 0, dimension: 0, type: 'player' as const, label: 'Player 1' },
       { id: '2', x: 100, y: 64, z: 100, dimension: 0, type: 'nether_portal' as const, label: 'Portal' },
@@ -96,8 +77,43 @@ describe('MapCanvas', () => {
         markers={markers}
       />
     );
-    // Canvas renders markers via canvas API, so we just verify the component renders
-    const canvas = container.querySelector('canvas');
-    expect(canvas).toBeInTheDocument();
+    const markerElements = container.querySelectorAll('.map-marker');
+    expect(markerElements).toHaveLength(2);
+  });
+
+  it('renders marker labels', () => {
+    const markers = [
+      { id: '1', x: 0, y: 64, z: 0, dimension: 0, type: 'player' as const, label: 'Player 1' },
+    ];
+
+    const { container } = render(
+      <MapCanvas
+        mode="offline"
+        config={mockConfig}
+        offlineReader={null}
+        backendService={null}
+        markers={markers}
+      />
+    );
+    const label = container.querySelector('.marker-label');
+    expect(label).toHaveTextContent('Player 1');
+  });
+
+  it('renders marker dots with correct type class', () => {
+    const markers = [
+      { id: '1', x: 0, y: 64, z: 0, dimension: 0, type: 'nether_portal' as const, label: 'NP' },
+    ];
+
+    const { container } = render(
+      <MapCanvas
+        mode="offline"
+        config={mockConfig}
+        offlineReader={null}
+        backendService={null}
+        markers={markers}
+      />
+    );
+    const dot = container.querySelector('.marker-dot');
+    expect(dot).toHaveClass('nether_portal');
   });
 });
