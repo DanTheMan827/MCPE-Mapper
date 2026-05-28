@@ -23,7 +23,7 @@ interface ChunkTileData {
   key: string;
   x: number;
   z: number;
-  pixels: Uint8ClampedArray;
+  pixels: ImageDataArray;
 }
 
 /** Yield control back to the event loop */
@@ -432,7 +432,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
         canvas.style.height = `${CHUNK_SIZE}px`;
         const ctx = canvas.getContext('2d');
         if (ctx) {
-          ctx.putImageData(new ImageData(Uint8ClampedArray.from(tile.pixels), 16, 16), 0, 0);
+          ctx.putImageData(new ImageData(tile.pixels, 16, 16), 0, 0);
         }
         canvasCache.current.set(key, canvas);
       }
