@@ -30,6 +30,8 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     zoom: 2,
   });
   const renderedChunks = useRef<Map<string, ImageData>>(new Map());
+  /** Tracks when each chunk was added for fade-in animation */
+  const chunkLoadTime = useRef<Map<string, number>>(new Map());
   const pendingChunks = useRef<Set<string>>(new Set());
   /** Tracks chunks that returned no data so we don't re-request them */
   const emptyChunks = useRef<Set<string>>(new Set());
@@ -37,6 +39,8 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   const lastPointer = useRef({ x: 0, y: 0 });
   const pinchDistance = useRef<number | null>(null);
   const animFrameRef = useRef<number>(0);
+  /** Duration in ms for chunk fade-in */
+  const FADE_DURATION = 400;
 
   // Load chunks that are visible
   const loadVisibleChunks = useCallback(async () => {
@@ -87,6 +91,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
             16
           );
           renderedChunks.current.set(key, imageData);
+          chunkLoadTime.current.set(key, performance.now());
         } else {
           // Mark as empty so we don't re-request it
           emptyChunks.current.add(key);
@@ -115,6 +120,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
               16
             );
             renderedChunks.current.set(key, imageData);
+            chunkLoadTime.current.set(key, performance.now());
             pendingChunks.current.delete(key);
             returnedKeys.add(key);
           }
@@ -144,6 +150,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     renderedChunks.current.clear();
     pendingChunks.current.clear();
     emptyChunks.current.clear();
+    chunkLoadTime.current.clear();
   }, [config.dimension, config.heightRange.min, config.heightRange.max]);
 
   // Subscribe to WebSocket chunk updates to invalidate specific cached chunks
@@ -203,14 +210,25 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       const startChunkZ = Math.floor((-offsetY / zoom - height / 2 / zoom) / pixelSize) - 1;
       const endChunkZ = Math.ceil((-offsetY / zoom + height / 2 / zoom) / pixelSize) + 1;
 
-      // Draw rendered chunks
+      // Draw rendered chunks with fade-in
       ctx.imageSmoothingEnabled = false;
+      const now = performance.now();
+      let hasAnimatingChunks = false;
 
       for (let cx = startChunkX; cx <= endChunkX; cx++) {
         for (let cz = startChunkZ; cz <= endChunkZ; cz++) {
           const key = `${cx},${cz},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
           const imageData = renderedChunks.current.get(key);
           if (imageData) {
+            // Calculate opacity based on time since chunk was loaded
+            const loadedAt = chunkLoadTime.current.get(key) || 0;
+            const elapsed = now - loadedAt;
+            const opacity = Math.min(1, elapsed / FADE_DURATION);
+
+            if (opacity < 1) hasAnimatingChunks = true;
+
+            ctx.globalAlpha = opacity;
+
             // Create a temporary canvas to draw ImageData
             const tmpCanvas = document.createElement('canvas');
             tmpCanvas.width = 16;
@@ -221,6 +239,9 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
           }
         }
       }
+
+      // Reset alpha for markers
+      ctx.globalAlpha = 1;
 
       // Draw markers
       for (const marker of markers) {
