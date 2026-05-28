@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { ViewerConfig, MapMarker, ChunkCoord } from '@mcpe-mapper/shared';
 import { OfflineWorldReader } from '../services/OfflineWorldReader';
 import { BackendService } from '../services/BackendService';
@@ -15,23 +15,20 @@ interface MapCanvasProps {
 const CHUNK_SIZE = 16;
 const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 32;
+/** Number of chunks to process per batch before yielding to the event loop */
+const CHUNK_BATCH_SIZE = 8;
 
-/** Converts ImageData to a data URL for use as a CSS background */
-function imageDataToDataURL(imageData: ImageData): string {
-  const canvas = document.createElement('canvas');
-  canvas.width = 16;
-  canvas.height = 16;
-  const ctx = canvas.getContext('2d')!;
-  ctx.putImageData(imageData, 0, 0);
-  return canvas.toDataURL();
-}
 
-interface ChunkTile {
+interface ChunkTileData {
   key: string;
   x: number;
   z: number;
-  dataUrl: string;
-  visible: boolean;
+  pixels: Uint8ClampedArray;
+}
+
+/** Yield control back to the event loop */
+function yieldToMain(): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, 0));
 }
 
 export const MapCanvas: React.FC<MapCanvasProps> = ({
@@ -42,13 +39,16 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   markers,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  /** Ref to the inner chunk layer div — chunk canvases are appended here imperatively */
+  const chunkLayerRef = useRef<HTMLDivElement>(null);
+  /** Off-DOM canvas pool: keeps canvases alive when culled so they need not be re-drawn */
+  const canvasCache = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const [viewState, setViewState] = useState({
     offsetX: 0,
     offsetY: 0,
     zoom: 2,
   });
-  const [chunkTiles, setChunkTiles] = useState<Map<string, ChunkTile>>(new Map());
-  const renderedChunks = useRef<Map<string, ImageData>>(new Map());
+  const [chunkTiles, setChunkTiles] = useState<Map<string, ChunkTileData>>(new Map());
   const pendingChunks = useRef<Set<string>>(new Set());
   /** Tracks chunks that returned no data so we don't re-request them */
   const emptyChunks = useRef<Set<string>>(new Set());
@@ -57,22 +57,47 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   const pinchDistance = useRef<number | null>(null);
   const pinchActive = useRef(false);
   const activeTouches = useRef(0);
+  /** Cancellation flag for in-progress chunk loading */
+  const loadGeneration = useRef(0);
+  /** Whether a load task is currently running */
+  const loadRunning = useRef(false);
+  /** Pending load request to run after current one finishes */
+  const pendingLoad = useRef(false);
 
-  // Load chunks that are visible
+  // Load chunks that are visible (and would be visible when zooming out)
   const loadVisibleChunks = useCallback(async () => {
+    // Only allow one rendering task at a time
+    if (loadRunning.current) {
+      pendingLoad.current = true;
+      return;
+    }
+    loadRunning.current = true;
+    pendingLoad.current = false;
+
     const container = containerRef.current;
-    if (!container) return;
+    if (!container) {
+      loadRunning.current = false;
+      return;
+    }
+
+    const generation = ++loadGeneration.current;
 
     const { offsetX, offsetY, zoom } = viewState;
     const width = container.clientWidth;
     const height = container.clientHeight;
 
-    // Calculate visible chunk range
-    const pixelSize = CHUNK_SIZE * zoom;
+    // Use a lower zoom (more zoomed out) to pre-render tiles that would
+    // become visible when zooming out
+    const effectiveZoom = Math.max(MIN_ZOOM, zoom * 0.5);
+    const pixelSize = CHUNK_SIZE * effectiveZoom;
     const startChunkX = Math.floor((-offsetX - width / 2) / pixelSize) - 1;
     const endChunkX = Math.ceil((-offsetX + width / 2) / pixelSize) + 1;
     const startChunkZ = Math.floor((-offsetY - height / 2) / pixelSize) - 1;
     const endChunkZ = Math.ceil((-offsetY + height / 2) / pixelSize) + 1;
+
+    // Center chunk for distance sorting
+    const centerChunkX = -offsetX / (CHUNK_SIZE * zoom);
+    const centerChunkZ = -offsetY / (CHUNK_SIZE * zoom);
 
     const chunksToLoad: ChunkCoord[] = [];
 
@@ -80,7 +105,14 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       for (let cz = startChunkZ; cz <= endChunkZ; cz++) {
         const key = `${cx},${cz},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
         // Skip if already rendered, already pending, or previously returned empty
-        if (renderedChunks.current.has(key) || pendingChunks.current.has(key) || emptyChunks.current.has(key)) {
+        if (pendingChunks.current.has(key) || emptyChunks.current.has(key)) {
+          continue;
+        }
+        // Check if already in tile state
+        if (chunkTiles.has(key)) continue;
+        // Skip chunks that don't exist in the offline database
+        if (mode === 'offline' && offlineReader && !offlineReader.hasChunk(cx, cz, config.dimension)) {
+          emptyChunks.current.add(key);
           continue;
         }
         chunksToLoad.push({ x: cx, z: cz });
@@ -88,36 +120,70 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       }
     }
 
-    if (chunksToLoad.length === 0) return;
+    if (chunksToLoad.length === 0) {
+      loadRunning.current = false;
+      // If a new request came in while we were checking, run it
+      if (pendingLoad.current) {
+        pendingLoad.current = false;
+        loadVisibleChunks();
+      }
+      return;
+    }
 
-    const newTiles = new Map(chunkTiles);
+    // Sort chunks from closest to center going outward
+    chunksToLoad.sort((a, b) => {
+      const distA = (a.x - centerChunkX) ** 2 + (a.z - centerChunkZ) ** 2;
+      const distB = (b.x - centerChunkX) ** 2 + (b.z - centerChunkZ) ** 2;
+      return distA - distB;
+    });
 
     if (mode === 'offline' && offlineReader) {
-      for (const coord of chunksToLoad) {
-        const chunkData = offlineReader.getChunkRender(
-          coord.x,
-          coord.z,
-          config.dimension,
-          config.heightRange
-        );
-        const key = `${coord.x},${coord.z},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
-        if (chunkData) {
-          const imageData = new ImageData(
-            new Uint8ClampedArray(chunkData.pixels),
-            16,
-            16
+      // Process in small batches, yielding to the event loop between batches
+      for (let i = 0; i < chunksToLoad.length; i += CHUNK_BATCH_SIZE) {
+        // Check if this load has been superseded
+        if (loadGeneration.current !== generation) break;
+
+        const batch = chunksToLoad.slice(i, i + CHUNK_BATCH_SIZE);
+        const newTiles = new Map<string, ChunkTileData>();
+
+        for (const coord of batch) {
+          const key = `${coord.x},${coord.z},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
+          const chunkData = offlineReader.getChunkRender(
+            coord.x,
+            coord.z,
+            config.dimension,
+            config.heightRange
           );
-          renderedChunks.current.set(key, imageData);
-          const dataUrl = imageDataToDataURL(imageData);
-          newTiles.set(key, { key, x: coord.x, z: coord.z, dataUrl, visible: false });
-        } else {
-          emptyChunks.current.add(key);
+          if (chunkData) {
+            const pixels = new Uint8ClampedArray(chunkData.pixels);
+            newTiles.set(key, { key, x: coord.x, z: coord.z, pixels });
+          } else {
+            emptyChunks.current.add(key);
+          }
+          pendingChunks.current.delete(key);
         }
-        pendingChunks.current.delete(key);
+
+        // Merge batch results into state
+        if (newTiles.size > 0) {
+          setChunkTiles(prev => {
+            const updated = new Map(prev);
+            for (const [k, v] of newTiles) {
+              updated.set(k, v);
+            }
+            return updated;
+          });
+        }
+
+        // Yield to the event loop to prevent hanging
+        if (i + CHUNK_BATCH_SIZE < chunksToLoad.length) {
+          await yieldToMain();
+        }
       }
     } else if (mode === 'backend' && backendService) {
       const batchSize = 32;
       for (let i = 0; i < chunksToLoad.length; i += batchSize) {
+        if (loadGeneration.current !== generation) break;
+
         const batch = chunksToLoad.slice(i, i + batchSize);
         try {
           const chunkDataList = await backendService.getChunks(
@@ -126,17 +192,15 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
             config.heightRange
           );
 
+          if (loadGeneration.current !== generation) break;
+
+          const newTiles = new Map<string, ChunkTileData>();
           const returnedKeys = new Set<string>();
+
           for (const chunkData of chunkDataList) {
             const key = `${chunkData.x},${chunkData.z},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
-            const imageData = new ImageData(
-              new Uint8ClampedArray(chunkData.pixels),
-              16,
-              16
-            );
-            renderedChunks.current.set(key, imageData);
-            const dataUrl = imageDataToDataURL(imageData);
-            newTiles.set(key, { key, x: chunkData.x, z: chunkData.z, dataUrl, visible: false });
+            const pixels = new Uint8ClampedArray(chunkData.pixels);
+            newTiles.set(key, { key, x: chunkData.x, z: chunkData.z, pixels });
             pendingChunks.current.delete(key);
             returnedKeys.add(key);
           }
@@ -148,6 +212,16 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
               pendingChunks.current.delete(key);
             }
           }
+
+          if (newTiles.size > 0) {
+            setChunkTiles(prev => {
+              const updated = new Map(prev);
+              for (const [k, v] of newTiles) {
+                updated.set(k, v);
+              }
+              return updated;
+            });
+          }
         } catch (err) {
           console.error('Failed to load chunks:', err);
           for (const coord of batch) {
@@ -158,25 +232,16 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       }
     }
 
-    setChunkTiles(newTiles);
-
-    // Trigger CSS transition: set visible to true after a frame
-    requestAnimationFrame(() => {
-      setChunkTiles(prev => {
-        const updated = new Map(prev);
-        for (const [key, tile] of updated) {
-          if (!tile.visible) {
-            updated.set(key, { ...tile, visible: true });
-          }
-        }
-        return updated;
-      });
-    });
+    loadRunning.current = false;
+    // If a new load was requested while this one was running, start it
+    if (pendingLoad.current) {
+      pendingLoad.current = false;
+      loadVisibleChunks();
+    }
   }, [mode, offlineReader, backendService, config, viewState, chunkTiles]);
 
   // Clear cache when config changes
   useEffect(() => {
-    renderedChunks.current.clear();
     pendingChunks.current.clear();
     emptyChunks.current.clear();
     setChunkTiles(new Map());
@@ -189,11 +254,6 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     const unsubscribe = backendService.onChunkUpdate((updatedCoords) => {
       for (const coord of updatedCoords) {
         const prefix = `${coord.x},${coord.z},`;
-        for (const key of renderedChunks.current.keys()) {
-          if (key.startsWith(prefix)) {
-            renderedChunks.current.delete(key);
-          }
-        }
         for (const key of emptyChunks.current) {
           if (key.startsWith(prefix)) {
             emptyChunks.current.delete(key);
@@ -220,7 +280,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       loadVisibleChunks();
     }, 100);
     return () => clearTimeout(timer);
-  }, [viewState, config, mode]);
+  }, [viewState, config, mode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Mouse/touch handlers
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
@@ -324,6 +384,81 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
 
   const { offsetX, offsetY, zoom } = viewState;
 
+  // Compute which tiles are currently visible in the viewport for culling.
+  // Non-visible tiles are kept in memory (chunkTiles) but not rendered in the DOM.
+  const visibleTiles = useMemo(() => {
+    const container = containerRef.current;
+    const width = container?.clientWidth || 0;
+    const height = container?.clientHeight || 0;
+    if (width === 0 || height === 0) return Array.from(chunkTiles.values());
+
+    const pixelSize = CHUNK_SIZE * zoom;
+    const startChunkX = Math.floor((-offsetX - width / 2) / pixelSize) - 1;
+    const endChunkX = Math.ceil((-offsetX + width / 2) / pixelSize) + 1;
+    const startChunkZ = Math.floor((-offsetY - height / 2) / pixelSize) - 1;
+    const endChunkZ = Math.ceil((-offsetY + height / 2) / pixelSize) + 1;
+
+    const result: ChunkTileData[] = [];
+    for (const tile of chunkTiles.values()) {
+      if (tile.x >= startChunkX && tile.x <= endChunkX &&
+          tile.z >= startChunkZ && tile.z <= endChunkZ) {
+        result.push(tile);
+      }
+    }
+    return result;
+  }, [chunkTiles, offsetX, offsetY, zoom]);
+
+  // Sync the canvas cache with the chunkTiles state.
+  // Creates a canvas and draws pixels once when a new tile is added;
+  // destroys the canvas (removing from DOM too) when a tile is removed.
+  useEffect(() => {
+    // Remove canvases for tiles that are no longer in state
+    for (const [key, canvas] of Array.from(canvasCache.current.entries())) {
+      if (!chunkTiles.has(key)) {
+        canvas.remove();
+        canvasCache.current.delete(key);
+      }
+    }
+    // Create and draw canvases for new tiles (not yet in the cache)
+    for (const [key, tile] of chunkTiles) {
+      if (!canvasCache.current.has(key)) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 16;
+        canvas.height = 16;
+        canvas.className = 'map-chunk-tile';
+        canvas.style.left = `${tile.x * CHUNK_SIZE}px`;
+        canvas.style.top = `${tile.z * CHUNK_SIZE}px`;
+        canvas.style.width = `${CHUNK_SIZE}px`;
+        canvas.style.height = `${CHUNK_SIZE}px`;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.putImageData(new ImageData(tile.pixels, 16, 16), 0, 0);
+        }
+        canvasCache.current.set(key, canvas);
+      }
+    }
+  }, [chunkTiles]);
+
+  // Sync DOM presence of chunk canvases based on which tiles are visible.
+  // Visible canvases are appended to the chunk layer div; non-visible ones
+  // are detached from the DOM but kept alive in canvasCache for fast re-attachment.
+  useEffect(() => {
+    const layer = chunkLayerRef.current;
+    if (!layer) return;
+
+    const visibleKeys = new Set(visibleTiles.map(t => t.key));
+
+    for (const [key, canvas] of canvasCache.current) {
+      if (visibleKeys.has(key)) {
+        if (!canvas.parentElement) {
+          layer.appendChild(canvas);
+        }
+      } else if (canvas.parentElement) {
+        canvas.remove();
+      }
+    }
+  }, [visibleTiles]);
+
   return (
     <div
       ref={containerRef}
@@ -337,29 +472,15 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
     >
-      {/* Chunk layer */}
+      {/* Chunk layer — canvases are managed imperatively via chunkLayerRef */}
       <div
+        ref={chunkLayerRef}
         className="map-chunk-layer"
         style={{
           transform: `translate(${offsetX + (containerRef.current?.clientWidth || 0) / 2}px, ${offsetY + (containerRef.current?.clientHeight || 0) / 2}px) scale(${zoom})`,
           transformOrigin: '0 0',
         }}
       >
-        {Array.from(chunkTiles.values()).map(tile => (
-          <div
-            key={tile.key}
-            className="map-chunk-tile"
-            style={{
-              left: tile.x * CHUNK_SIZE,
-              top: tile.z * CHUNK_SIZE,
-              width: CHUNK_SIZE,
-              height: CHUNK_SIZE,
-              backgroundImage: `url(${tile.dataUrl})`,
-              opacity: tile.visible ? 1 : 0,
-            }}
-          />
-        ))}
-
         {/* Markers */}
         {markers.map(marker => (
           <div

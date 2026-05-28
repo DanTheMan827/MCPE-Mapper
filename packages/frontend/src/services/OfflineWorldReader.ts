@@ -15,12 +15,15 @@ export class OfflineWorldReader {
   private chunkCache: Map<string, ChunkRenderData> = new Map();
   private parsedKeys: Map<string, Uint8Array> = new Map();
   private dbParsed = false;
+  /** Index mapping "chunkX,chunkZ,dimension" to set of subchunk key hex strings */
+  private chunkIndex: Map<string, Set<string>> = new Map();
 
   async loadFile(file: File): Promise<WorldInfo> {
     this.zip = await JSZip.loadAsync(file);
     this.dbFiles.clear();
     this.parsedKeys.clear();
     this.chunkCache.clear();
+    this.chunkIndex.clear();
     this.dbParsed = false;
 
     // Load DB files into memory
@@ -214,10 +217,12 @@ export class OfflineWorldReader {
   private async parseDB(): Promise<void> {
     if (this.dbParsed) return;
 
-    // Parse LDB files (sorted table files)
+    // Parse LDB files (sorted table files), yielding between each file so the
+    // event loop can process UI updates and prevent the page from hanging.
     for (const [filename, data] of this.dbFiles) {
       if (filename.endsWith('.ldb') || filename.endsWith('.sst')) {
         this.parseLDBFile(data);
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
       }
     }
 
@@ -225,6 +230,7 @@ export class OfflineWorldReader {
     for (const [filename, data] of this.dbFiles) {
       if (filename.endsWith('.log')) {
         this.parseLogFile(data);
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
       }
     }
 
@@ -429,7 +435,7 @@ export class OfflineWorldReader {
 
       let pos = offset;
       while (pos + 7 <= blockEnd) {
-        const view = new DataView(data.buffer, data.byteOffset + pos, Math.min(7, data.length - pos - data.byteOffset));
+        const view = new DataView(data.buffer, data.byteOffset + pos, Math.min(7, data.length - pos));
         // const checksum = view.getUint32(0, true);
         const length = view.getUint16(4, true);
         const type = view.getUint8(6);
@@ -491,6 +497,48 @@ export class OfflineWorldReader {
   private storeKey(key: Uint8Array, value: Uint8Array): void {
     const keyStr = this.keyToString(key);
     this.parsedKeys.set(keyStr, value);
+    // Index subchunk keys for fast chunk lookup
+    this.indexChunkKey(key, keyStr);
+  }
+
+  /**
+   * Index a key into the chunk index if it's a subchunk key.
+   */
+  private indexChunkKey(key: Uint8Array, keyHex: string): void {
+    if (key.length < 9) return;
+
+    const view = new DataView(key.buffer, key.byteOffset, key.byteLength);
+    const x = view.getInt32(0, true);
+    const z = view.getInt32(4, true);
+
+    // Check overworld subchunk key
+    if (key.length >= 9 && key.length <= 14 && key[8] === 0x2f) {
+      const indexKey = `${x},${z},0`;
+      let set = this.chunkIndex.get(indexKey);
+      if (!set) { set = new Set(); this.chunkIndex.set(indexKey, set); }
+      set.add(keyHex);
+      return;
+    }
+
+    // Check other dimension subchunk keys
+    if (key.length >= 13) {
+      const dim = view.getInt32(8, true);
+      if (key[12] === 0x2f) {
+        const indexKey = `${x},${z},${dim}`;
+        let set = this.chunkIndex.get(indexKey);
+        if (!set) { set = new Set(); this.chunkIndex.set(indexKey, set); }
+        set.add(keyHex);
+      }
+    }
+  }
+
+  /**
+   * Check if a chunk exists in the database.
+   */
+  hasChunk(chunkX: number, chunkZ: number, dimension: number): boolean {
+    const indexKey = `${chunkX},${chunkZ},${dimension}`;
+    const set = this.chunkIndex.get(indexKey);
+    return !!set && set.size > 0;
   }
 
   private keyToString(key: Uint8Array): string {
@@ -584,36 +632,28 @@ export class OfflineWorldReader {
       return this.chunkCache.get(cacheKey)!;
     }
 
+    // Use chunk index for fast lookup instead of iterating all keys
+    const indexKey = `${chunkX},${chunkZ},${dimension}`;
+    const chunkKeySet = this.chunkIndex.get(indexKey);
+    if (!chunkKeySet || chunkKeySet.size === 0) return null;
+
     // Collect subchunk data for this chunk
     const subchunks = new Map<number, Uint8Array>();
 
-    for (const [keyHex, value] of this.parsedKeys) {
+    for (const keyHex of chunkKeySet) {
+      const value = this.parsedKeys.get(keyHex);
+      if (!value) continue;
+
       const key = this.hexToBytes(keyHex);
-      const view = new DataView(key.buffer, key.byteOffset, key.byteLength);
-
-      if (key.length < 9) continue;
-
-      const kx = view.getInt32(0, true);
-      const kz = view.getInt32(4, true);
-
-      if (kx !== chunkX || kz !== chunkZ) continue;
-
-      let tag: number;
       let subchunkIdx: number | undefined;
 
       if (dimension === 0) {
-        if (key.length < 9) continue;
-        tag = key[8];
         if (key.length >= 10) subchunkIdx = (key[9] << 24) >> 24; // signed int8
       } else {
-        if (key.length < 13) continue;
-        const dim = view.getInt32(8, true);
-        if (dim !== dimension) continue;
-        tag = key[12];
         if (key.length >= 14) subchunkIdx = (key[13] << 24) >> 24; // signed int8
       }
 
-      if (tag === 0x2f && subchunkIdx !== undefined) {
+      if (subchunkIdx !== undefined) {
         subchunks.set(subchunkIdx, value);
       }
     }
@@ -677,6 +717,7 @@ export class OfflineWorldReader {
    * Bedrock subchunk format (version 8+):
    * version (1 byte), num_storages (1 byte), then for each storage:
    *   bits_per_block|flags (1 byte), blocks (ceil(4096*bpb/32)*4 bytes), palette (NBT list)
+   * Note: version 9 inserts an extra subchunk-Y byte between num_storages and the first storage.
    */
   private getBlockFromSubchunk(data: Uint8Array, x: number, y: number, z: number): string | null {
     if (data.length < 2) return null;
@@ -689,6 +730,10 @@ export class OfflineWorldReader {
     if (version >= 8) {
       numStorages = data[1];
       offset = 2;
+    }
+    // Version 9 adds an extra subchunk-Y index byte after num_storages (before the first storage).
+    if (version >= 9) {
+      offset = 3;
     }
 
     if (numStorages < 1) return null;
