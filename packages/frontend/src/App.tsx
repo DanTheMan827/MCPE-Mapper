@@ -148,7 +148,15 @@ const App: React.FC = () => {
   return (
     <div className="app-container">
       {mode === 'idle' && !loading && backendAvailable === false && (
-        <FileDropZone onFileLoad={handleFileLoad} onBackendConnect={handleBackendConnect} />
+        <FileDropZone
+          onFileLoad={handleFileLoad}
+          onBackendConnect={handleBackendConnect}
+          showBackendOption={false}
+        />
+      )}
+
+      {mode === 'idle' && backendAvailable === null && !loading && (
+        <LoadingIndicator message="Checking for backend..." />
       )}
 
       {mode !== 'idle' && (

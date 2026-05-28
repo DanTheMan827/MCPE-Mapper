@@ -3,9 +3,10 @@ import React, { useCallback, useRef, useState } from 'react';
 interface FileDropZoneProps {
   onFileLoad: (file: File) => void;
   onBackendConnect: (url: string) => void;
+  showBackendOption?: boolean;
 }
 
-export const FileDropZone: React.FC<FileDropZoneProps> = ({ onFileLoad, onBackendConnect }) => {
+export const FileDropZone: React.FC<FileDropZoneProps> = ({ onFileLoad, onBackendConnect, showBackendOption = true }) => {
   const [dragging, setDragging] = useState(false);
   const [backendUrl, setBackendUrl] = useState('');
   const [showBackend, setShowBackend] = useState(false);
@@ -54,6 +55,7 @@ export const FileDropZone: React.FC<FileDropZoneProps> = ({ onFileLoad, onBacken
       <input
         ref={fileInputRef}
         type="file"
+        accept=".mcworld,.zip"
         style={{ display: 'none' }}
         onChange={handleFileSelect}
       />
@@ -62,25 +64,27 @@ export const FileDropZone: React.FC<FileDropZoneProps> = ({ onFileLoad, onBacken
         <>
           <h2>🗺️ MCPE Mapper</h2>
           <p>Drop a .mcworld file here or click to browse</p>
-          <p style={{ marginTop: 16, fontSize: 12, color: 'var(--text-secondary)' }}>
-            or{' '}
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                setShowBackend(true);
-              }}
-              style={{
-                background: 'none',
-                border: 'none',
-                color: 'var(--accent)',
-                cursor: 'pointer',
-                textDecoration: 'underline',
-                fontSize: 12,
-              }}
-            >
-              connect to a backend server
-            </button>
-          </p>
+          {showBackendOption && (
+            <p style={{ marginTop: 16, fontSize: 12, color: 'var(--text-secondary)' }}>
+              or{' '}
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowBackend(true);
+                }}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: 'var(--accent)',
+                  cursor: 'pointer',
+                  textDecoration: 'underline',
+                  fontSize: 12,
+                }}
+              >
+                connect to a backend server
+              </button>
+            </p>
+          )}
         </>
       ) : (
         <form onSubmit={handleBackendSubmit} onClick={(e) => e.stopPropagation()}>
