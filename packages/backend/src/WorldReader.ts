@@ -427,8 +427,9 @@ export class WorldReader {
         label: 'World Spawn',
       });
 
-      // Look for local player data in DB
+      // Look for local player and multiplayer player data in DB
       await this.withDB(async (db) => {
+        // Local player
         try {
           const playerKey = Buffer.from('~local_player');
           const playerData = await db.get(playerKey);
@@ -446,6 +447,32 @@ export class WorldReader {
           }
         } catch {
           // No local player data
+        }
+
+        // Multiplayer players (keys starting with "player_")
+        try {
+          const iterator = db.iterator();
+          for await (const [key, value] of iterator) {
+            const keyStr = key.toString('utf8');
+            if (keyStr.startsWith('player_')) {
+              const playerId = keyStr.slice('player_'.length);
+              const pos = this.parsePlayerPosition(value);
+              if (pos) {
+                markers.push({
+                  id: `player_${playerId}`,
+                  x: Math.floor(pos.x),
+                  y: Math.floor(pos.y),
+                  z: Math.floor(pos.z),
+                  dimension: pos.dimension,
+                  type: 'player',
+                  label: `Player ${playerId.slice(0, 8)}`,
+                });
+              }
+            }
+          }
+          await iterator.close();
+        } catch {
+          // Error reading multiplayer data
         }
       });
     }

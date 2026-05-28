@@ -512,7 +512,7 @@ export class OfflineWorldReader {
   private hexToBytes(hex: string): Uint8Array {
     const bytes = new Uint8Array(hex.length / 2);
     for (let i = 0; i < hex.length; i += 2) {
-      bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+      bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
     }
     return bytes;
   }
@@ -864,7 +864,7 @@ export class OfflineWorldReader {
   getMarkers(): MapMarker[] {
     const markers: MapMarker[] = [];
 
-    // Look for player position in level.dat
+    // Add spawn/player info from level.dat
     if (this.worldInfo) {
       markers.push({
         id: 'spawn',
@@ -875,6 +875,47 @@ export class OfflineWorldReader {
         type: 'player',
         label: 'World Spawn',
       });
+    }
+
+    // Look for local player and multiplayer player keys
+    for (const [keyHex, value] of this.parsedKeys) {
+      const key = this.hexToBytes(keyHex);
+
+      // Check for ~local_player key
+      try {
+        const keyStr = new TextDecoder().decode(key);
+        if (keyStr === '~local_player') {
+          const pos = this.parsePlayerNBT(value);
+          if (pos) {
+            markers.push({
+              id: 'local_player',
+              x: Math.floor(pos.x),
+              y: Math.floor(pos.y),
+              z: Math.floor(pos.z),
+              dimension: pos.dimension,
+              type: 'player',
+              label: 'Player',
+            });
+          }
+        } else if (keyStr.startsWith('player_')) {
+          // Multiplayer player
+          const playerId = keyStr.slice('player_'.length);
+          const pos = this.parsePlayerNBT(value);
+          if (pos) {
+            markers.push({
+              id: `player_${playerId}`,
+              x: Math.floor(pos.x),
+              y: Math.floor(pos.y),
+              z: Math.floor(pos.z),
+              dimension: pos.dimension,
+              type: 'player',
+              label: `Player ${playerId.slice(0, 8)}`,
+            });
+          }
+        }
+      } catch {
+        // Not a text key, skip
+      }
     }
 
     // Look for portal blocks in parsed data
@@ -906,6 +947,58 @@ export class OfflineWorldReader {
     }
 
     return markers;
+  }
+
+  private parsePlayerNBT(data: Uint8Array): { x: number; y: number; z: number; dimension: number } | null {
+    try {
+      if (data.length < 3 || data[0] !== 10) return null;
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+      let offset = 1;
+      const rootNameLen = view.getInt16(offset, true);
+      offset += 2 + rootNameLen;
+
+      let x = 0, y = 0, z = 0, dimension = 0;
+      let foundPos = false;
+
+      while (offset < data.length) {
+        const tagType = data[offset]; offset++;
+        if (tagType === 0) break;
+
+        const nameLen = view.getInt16(offset, true); offset += 2;
+        const tagName = new TextDecoder().decode(data.slice(offset, offset + nameLen));
+        offset += nameLen;
+
+        if (tagType === 9 && tagName === 'Pos') {
+          // List of floats
+          const listType = data[offset]; offset++;
+          const listLen = view.getInt32(offset, true); offset += 4;
+          if (listType === 5 && listLen === 3) {
+            x = view.getFloat32(offset, true); offset += 4;
+            y = view.getFloat32(offset, true); offset += 4;
+            z = view.getFloat32(offset, true); offset += 4;
+            foundPos = true;
+          } else {
+            for (let i = 0; i < listLen; i++) {
+              const skip = this.skipNBTPayload(listType, data, offset);
+              if (skip < 0) return null;
+              offset += skip;
+            }
+          }
+        } else if (tagType === 3 && tagName === 'DimensionId') {
+          dimension = view.getInt32(offset, true); offset += 4;
+        } else {
+          const skip = this.skipNBTPayload(tagType, data, offset);
+          if (skip < 0) return null;
+          offset += skip;
+        }
+      }
+
+      if (foundPos) return { x, y, z, dimension };
+    } catch {
+      // Parse error
+    }
+    return null;
   }
 
   private extractPortalMarkers(data: Uint8Array, chunkX: number, chunkZ: number, dimension: number, markers: MapMarker[]): void {
