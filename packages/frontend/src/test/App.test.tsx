@@ -2,6 +2,17 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import App from '../App';
 
+// Mock WebSocket to prevent auto-connect attempts
+vi.stubGlobal('WebSocket', vi.fn().mockImplementation(() => ({
+  close: vi.fn(),
+  addEventListener: vi.fn(),
+  removeEventListener: vi.fn(),
+  onopen: null,
+  onclose: null,
+  onerror: null,
+  onmessage: null,
+})));
+
 // Mock canvas context
 vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
   fillRect: vi.fn(),
@@ -25,19 +36,19 @@ vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue({
 } as any);
 
 describe('App', () => {
-  it('renders the file drop zone in idle state', () => {
+  it('shows checking indicator while probing backend', () => {
     render(<App />);
-    expect(screen.getByText('🗺️ MCPE Mapper')).toBeInTheDocument();
+    expect(screen.getByText('Checking for backend...')).toBeInTheDocument();
   });
 
-  it('renders file drop instructions', () => {
+  it('does not show file drop zone while checking for backend', () => {
     render(<App />);
-    expect(screen.getByText(/Drop a .mcworld file/)).toBeInTheDocument();
+    expect(screen.queryByText('🗺️ MCPE Mapper')).not.toBeInTheDocument();
   });
 
-  it('has a backend connection option', () => {
+  it('does not show backend connection option', () => {
     render(<App />);
-    expect(screen.getByText('connect to a backend server')).toBeInTheDocument();
+    expect(screen.queryByText('connect to a backend server')).not.toBeInTheDocument();
   });
 
   it('renders the app-container class', () => {

@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { WorldInfo, MapMarker, HeightRange, ViewerConfig } from '@mcpe-mapper/shared';
 import { MapCanvas } from './components/MapCanvas';
 import { ControlsPanel } from './components/ControlsPanel';
@@ -19,6 +19,7 @@ const App: React.FC = () => {
   const [offlineReader, setOfflineReader] = useState<OfflineWorldReader | null>(null);
   const [backendService, setBackendService] = useState<BackendService | null>(null);
   const [features, setFeatures] = useState({ portals: true, players: true });
+  const [backendAvailable, setBackendAvailable] = useState<boolean | null>(null);
 
   const [config, setConfig] = useState<ViewerConfig>({
     showNetherPortals: true,
@@ -27,6 +28,60 @@ const App: React.FC = () => {
     heightRange: { min: -64, max: 320 },
     dimension: 0,
   });
+
+  // Check if a backend WebSocket is available at ./bedrock-socket
+  useEffect(() => {
+    if (mode !== 'idle') return;
+
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProtocol}//${window.location.host}${window.location.pathname.replace(/\/$/, '')}/bedrock-socket`;
+
+    let ws: WebSocket | null = null;
+    let cancelled = false;
+
+    try {
+      ws = new WebSocket(wsUrl);
+
+      const timeout = setTimeout(() => {
+        if (!cancelled) {
+          cancelled = true;
+          ws?.close();
+          setBackendAvailable(false);
+        }
+      }, 3000);
+
+      ws.onopen = () => {
+        if (cancelled) { ws?.close(); return; }
+        clearTimeout(timeout);
+        cancelled = true;
+        ws?.close();
+        // Backend is available - auto-connect using the base URL
+        const baseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
+        handleBackendConnect(baseUrl);
+      };
+
+      ws.onerror = () => {
+        if (cancelled) return;
+        clearTimeout(timeout);
+        cancelled = true;
+        setBackendAvailable(false);
+      };
+
+      ws.onclose = () => {
+        if (cancelled) return;
+        clearTimeout(timeout);
+        cancelled = true;
+        setBackendAvailable(false);
+      };
+    } catch {
+      setBackendAvailable(false);
+    }
+
+    return () => {
+      cancelled = true;
+      ws?.close();
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleFileLoad = useCallback(async (file: File) => {
     setLoading(true);
@@ -92,8 +147,16 @@ const App: React.FC = () => {
 
   return (
     <div className="app-container">
-      {mode === 'idle' && !loading && (
-        <FileDropZone onFileLoad={handleFileLoad} onBackendConnect={handleBackendConnect} />
+      {mode === 'idle' && !loading && backendAvailable === false && (
+        <FileDropZone
+          onFileLoad={handleFileLoad}
+          onBackendConnect={handleBackendConnect}
+          showBackendOption={false}
+        />
+      )}
+
+      {mode === 'idle' && backendAvailable === null && !loading && (
+        <LoadingIndicator message="Checking for backend..." />
       )}
 
       {mode !== 'idle' && (

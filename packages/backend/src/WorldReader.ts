@@ -96,7 +96,10 @@ export class WorldReader {
         if (tagName === 'LevelName' && typeof payload.value === 'string') info.name = payload.value;
         if (tagName === 'GameType' && typeof payload.value === 'number') info.gameType = payload.value;
         if (tagName === 'SpawnX' && typeof payload.value === 'number') info.spawnX = payload.value;
-        if (tagName === 'SpawnY' && typeof payload.value === 'number') info.spawnY = payload.value;
+        if (tagName === 'SpawnY' && typeof payload.value === 'number') {
+          // 32767 (0x7FFF) means "auto/surface level" in Bedrock Edition
+          info.spawnY = payload.value === 32767 ? 64 : payload.value;
+        }
         if (tagName === 'SpawnZ' && typeof payload.value === 'number') info.spawnZ = payload.value;
         if (tagName === 'LastPlayed') info.lastPlayed = Number(payload.value);
 

@@ -10,7 +10,7 @@ describe('FileDropZone', () => {
 
   it('renders the drop instruction', () => {
     render(<FileDropZone onFileLoad={() => {}} onBackendConnect={() => {}} />);
-    expect(screen.getByText(/Drop a .mcworld file/)).toBeInTheDocument();
+    expect(screen.getByText(/Drop a world file/)).toBeInTheDocument();
   });
 
   it('shows backend connection form when link is clicked', () => {
@@ -59,9 +59,9 @@ describe('FileDropZone', () => {
     expect(input).toHaveStyle({ display: 'none' });
   });
 
-  it('accepts .mcworld and .zip files', () => {
+  it('accepts all file types for content validation', () => {
     const { container } = render(<FileDropZone onFileLoad={() => {}} onBackendConnect={() => {}} />);
     const input = container.querySelector('input[type="file"]');
-    expect(input).toHaveAttribute('accept', '.mcworld,.zip');
+    expect(input).not.toHaveAttribute('accept');
   });
 });

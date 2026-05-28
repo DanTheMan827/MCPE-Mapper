@@ -55,6 +55,8 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   const isDragging = useRef(false);
   const lastPointer = useRef({ x: 0, y: 0 });
   const pinchDistance = useRef<number | null>(null);
+  const pinchActive = useRef(false);
+  const activeTouches = useRef(0);
 
   // Load chunks that are visible
   const loadVisibleChunks = useCallback(async () => {
@@ -222,13 +224,14 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
 
   // Mouse/touch handlers
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
+    if (pinchActive.current) return;
     isDragging.current = true;
     lastPointer.current = { x: e.clientX, y: e.clientY };
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
   }, []);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
-    if (!isDragging.current) return;
+    if (!isDragging.current || pinchActive.current) return;
     const dx = e.clientX - lastPointer.current.x;
     const dy = e.clientY - lastPointer.current.y;
     lastPointer.current = { x: e.clientX, y: e.clientY };
@@ -267,7 +270,10 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
 
   // Touch gesture handling (pinch zoom)
   const handleTouchStart = useCallback((e: React.TouchEvent) => {
+    activeTouches.current = e.touches.length;
     if (e.touches.length === 2) {
+      pinchActive.current = true;
+      isDragging.current = false;
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       pinchDistance.current = Math.sqrt(dx * dx + dy * dy);
@@ -276,21 +282,44 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
 
   const handleTouchMove = useCallback((e: React.TouchEvent) => {
     if (e.touches.length === 2 && pinchDistance.current !== null) {
+      e.preventDefault();
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       const newDist = Math.sqrt(dx * dx + dy * dy);
       const scale = newDist / pinchDistance.current;
       pinchDistance.current = newDist;
 
-      setViewState(prev => ({
-        ...prev,
-        zoom: Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, prev.zoom * scale)),
-      }));
+      const container = containerRef.current;
+      if (!container) return;
+
+      // Zoom centered on pinch midpoint
+      const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      const rect = container.getBoundingClientRect();
+      const mx = midX - rect.left - container.clientWidth / 2;
+      const my = midY - rect.top - container.clientHeight / 2;
+
+      setViewState(prev => {
+        const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, prev.zoom * scale));
+        const zoomRatio = newZoom / prev.zoom;
+        return {
+          zoom: newZoom,
+          offsetX: mx - (mx - prev.offsetX) * zoomRatio,
+          offsetY: my - (my - prev.offsetY) * zoomRatio,
+        };
+      });
     }
   }, []);
 
-  const handleTouchEnd = useCallback(() => {
-    pinchDistance.current = null;
+  const handleTouchEnd = useCallback((e: React.TouchEvent) => {
+    activeTouches.current = e.touches.length;
+    if (e.touches.length < 2) {
+      pinchDistance.current = null;
+      // Delay clearing pinch state to prevent stale pointer events from causing jitter
+      setTimeout(() => {
+        pinchActive.current = false;
+      }, 100);
+    }
   }, []);
 
   const { offsetX, offsetY, zoom } = viewState;
