@@ -54,7 +54,6 @@ export const FileDropZone: React.FC<FileDropZoneProps> = ({ onFileLoad, onBacken
       <input
         ref={fileInputRef}
         type="file"
-        accept=".mcworld,.zip"
         style={{ display: 'none' }}
         onChange={handleFileSelect}
       />
