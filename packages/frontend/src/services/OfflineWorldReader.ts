@@ -1,4 +1,5 @@
 import JSZip from 'jszip';
+import pako from 'pako';
 import { ChunkRenderData, HeightRange, MapMarker, WorldInfo } from '@mcpe-mapper/shared';
 import { getBlockColor, isTransparent } from '@mcpe-mapper/shared';
 
@@ -87,7 +88,11 @@ export class OfflineWorldReader {
         if (compound['LevelName']) info.name = compound['LevelName'] as string;
         if (compound['GameType'] !== undefined) info.gameType = compound['GameType'] as number;
         if (compound['SpawnX'] !== undefined) info.spawnX = compound['SpawnX'] as number;
-        if (compound['SpawnY'] !== undefined) info.spawnY = compound['SpawnY'] as number;
+        if (compound['SpawnY'] !== undefined) {
+          const rawSpawnY = compound['SpawnY'] as number;
+          // 32767 (0x7FFF) means "auto/surface level" in Bedrock Edition
+          info.spawnY = rawSpawnY === 32767 ? 64 : rawSpawnY;
+        }
         if (compound['SpawnZ'] !== undefined) info.spawnZ = compound['SpawnZ'] as number;
         if (compound['LastPlayed'] !== undefined) info.lastPlayed = Number(compound['LastPlayed']);
       }
@@ -238,9 +243,10 @@ export class OfflineWorldReader {
       const footerOffset = data.length - 48;
 
       // Check magic number (last 8 bytes of footer)
+      // LevelDB table magic: 0xdb4775248b80fb57 stored as two LE uint32s
       const magic1 = view.getUint32(footerOffset + 40, true);
       const magic2 = view.getUint32(footerOffset + 44, true);
-      if (magic1 !== 0xdb4775e5 || magic2 !== 0x0d0a0a1a) {
+      if (magic1 !== 0x8b80fb57 || magic2 !== 0xdb477524) {
         // Not a valid table file, skip
         return;
       }
@@ -265,7 +271,7 @@ export class OfflineWorldReader {
 
       // Read index block
       if (indexOffset + indexSize > data.length) return;
-      const indexBlock = this.readBlock(data, view, indexOffset);
+      const indexBlock = this.readBlock(data, view, indexOffset, indexSize);
       if (!indexBlock) return;
 
       // Parse index block entries to find data blocks
@@ -275,16 +281,29 @@ export class OfflineWorldReader {
     }
   }
 
-  private readBlock(data: Uint8Array, view: DataView, offset: number): Uint8Array | null {
-    // Block format: data, compression_type (1 byte), crc (4 bytes)
-    // But we need to know the size from the block handle
-    // For simplicity, read until we detect the end
-    // Actually, block handles include offset+size, so we need that from the caller
-    // Let's try a different approach - scan for key-value pairs directly
+  private readBlock(data: Uint8Array, _view: DataView, offset: number, size: number): Uint8Array | null {
+    // Block format on disk: data[size] + compression_type[1] + crc[4]
+    if (offset + size + 1 > data.length) return null;
+    const compressionType = data[offset + size];
+    const raw = data.slice(offset, offset + size);
 
-    // Just return a slice starting from offset
-    // We'll parse lazily
-    return data.slice(offset);
+    if (compressionType === 0) {
+      // No compression
+      return raw;
+    }
+
+    // Compression types 2 and 4 (zlib raw deflate) used by Bedrock LevelDB
+    try {
+      return pako.inflateRaw(raw);
+    } catch {
+      // Fall through
+    }
+    try {
+      return pako.inflate(raw);
+    } catch {
+      // Fall through
+    }
+    return null;
   }
 
   private parseIndexBlock(indexBlock: Uint8Array, fullData: Uint8Array, fullView: DataView): void {
@@ -294,10 +313,13 @@ export class OfflineWorldReader {
     let pos = 0;
     let prevKey = new Uint8Array(0);
 
-    // Read restart count from end of block
-    // The block ends with: [restart_offsets...] [num_restarts (4 bytes)]
-    // For simplicity, just try to parse entries from the beginning
-    while (pos < indexBlock.length - 4) {
+    // Read restart count from end of block to determine data region
+    if (indexBlock.length < 4) return;
+    const ibView = new DataView(indexBlock.buffer, indexBlock.byteOffset, indexBlock.byteLength);
+    const numRestarts = ibView.getUint32(indexBlock.length - 4, true);
+    const dataEnd = indexBlock.length - 4 - numRestarts * 4;
+
+    while (pos < dataEnd) {
       try {
         const { value: shared, bytesRead: b1 } = this.readVarint(indexBlock, pos);
         if (shared > prevKey.length) break;
@@ -309,7 +331,7 @@ export class OfflineWorldReader {
         const { value: valueLen, bytesRead: b3 } = this.readVarint(indexBlock, pos);
         pos += b3;
 
-        if (pos + unshared + valueLen > indexBlock.length) break;
+        if (pos + unshared + valueLen > dataEnd) break;
         if (unshared > 10000 || valueLen > 100) break; // Sanity check
 
         // Reconstruct key
@@ -329,8 +351,11 @@ export class OfflineWorldReader {
         void hb2;
 
         if (blockOffset + blockSize <= fullData.length) {
-          // Parse this data block
-          this.parseDataBlock(fullData.slice(blockOffset, blockOffset + blockSize));
+          // Decompress and parse this data block
+          const decompressed = this.readBlock(fullData, fullView, blockOffset, blockSize);
+          if (decompressed) {
+            this.parseDataBlock(decompressed);
+          }
         }
       } catch {
         break;
@@ -579,13 +604,13 @@ export class OfflineWorldReader {
       if (dimension === 0) {
         if (key.length < 9) continue;
         tag = key[8];
-        if (key.length >= 10) subchunkIdx = key[9];
+        if (key.length >= 10) subchunkIdx = (key[9] << 24) >> 24; // signed int8
       } else {
         if (key.length < 13) continue;
         const dim = view.getInt32(8, true);
         if (dim !== dimension) continue;
         tag = key[12];
-        if (key.length >= 14) subchunkIdx = key[13];
+        if (key.length >= 14) subchunkIdx = (key[13] << 24) >> 24; // signed int8
       }
 
       if (tag === 0x2f && subchunkIdx !== undefined) {

@@ -82,7 +82,7 @@ export function startServer(config: ServerConfig) {
   const server = createServer(app);
 
   // WebSocket server for live updates
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({ server, path: '/bedrock-socket' });
   const clients = new Set<WebSocket>();
 
   wss.on('connection', (ws) => {

@@ -42,7 +42,14 @@ export class BackendService {
   }
 
   connectWebSocket(): void {
-    const wsUrl = this.baseUrl.replace(/^http/, 'ws') + '/ws';
+    const wsProtocol = this.baseUrl.startsWith('https') ? 'wss:' : 'ws:';
+    let wsUrl: string;
+    try {
+      const url = new URL(this.baseUrl);
+      wsUrl = `${wsProtocol}//${url.host}${url.pathname.replace(/\/$/, '')}/bedrock-socket`;
+    } catch {
+      wsUrl = this.baseUrl.replace(/^http/, 'ws') + '/bedrock-socket';
+    }
     this.ws = new WebSocket(wsUrl);
 
     this.ws.onmessage = (event) => {
