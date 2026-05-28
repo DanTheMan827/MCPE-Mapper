@@ -90,32 +90,33 @@ export function startServer(config: ServerConfig) {
     ws.on('close', () => clients.delete(ws));
   });
 
-  // Poll for world changes (check every 10 seconds)
+  // Load world into memory at startup, refresh every 15 minutes
   const worldReader = new WorldReader(config.worldPath);
-  let lastCheckTime = Date.now();
+  worldReader.load().catch(err => console.error('Failed to load world:', err));
 
-  const pollInterval = setInterval(async () => {
+  const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+  const refreshInterval = setInterval(async () => {
     try {
-      const updatedChunks = await worldReader.getModifiedChunks(lastCheckTime);
-      lastCheckTime = Date.now();
-
-      if (updatedChunks.length > 0) {
-        const message = JSON.stringify({
-          type: 'chunk_updated',
-          data: updatedChunks,
-        });
-        clients.forEach(client => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(message);
-          }
-        });
-      }
-    } catch {
-      // Ignore polling errors
+      await worldReader.load();
+      // Notify connected clients that all chunks may have changed
+      const message = JSON.stringify({
+        type: 'chunk_updated',
+        data: [{ x: 0, z: 0 }],
+      });
+      clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(message);
+        }
+      });
+    } catch (err) {
+      console.error('Failed to refresh world:', err);
     }
-  }, 10000);
+  }, REFRESH_INTERVAL_MS);
 
-  server.on('close', () => clearInterval(pollInterval));
+  server.on('close', () => {
+    clearInterval(refreshInterval);
+    worldReader.close();
+  });
 
   server.listen(config.port, () => {
     console.log(`MCPE Mapper backend running on http://localhost:${config.port}`);

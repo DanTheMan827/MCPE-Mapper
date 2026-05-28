@@ -1,16 +1,22 @@
-import { ClassicLevel } from 'classic-level';
 import { ChunkCoord, ChunkRenderData, HeightRange, MapMarker, WorldInfo } from '@mcpe-mapper/shared';
 import { getBlockColor, isTransparent } from '@mcpe-mapper/shared';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as zlib from 'zlib';
 
 /**
  * Reads Minecraft Bedrock world data from an unpacked world directory.
- * Opens and closes the LevelDB as needed to avoid holding locks.
+ * All LevelDB files are loaded into memory; the on-disk files are only read,
+ * never modified. Supports periodic refresh to pick up external changes.
  */
 export class WorldReader {
   private worldPath: string;
   private dbPath: string;
+  /** In-memory key-value store parsed from LevelDB files */
+  private parsedKeys: Map<string, Buffer> = new Map();
+  /** Chunk index: "x,z,dim" → set of key hex strings with subchunk data */
+  private chunkIndex: Map<string, Set<string>> = new Map();
+  private loaded = false;
 
   constructor(worldPath: string) {
     this.worldPath = worldPath;
@@ -18,27 +24,318 @@ export class WorldReader {
   }
 
   /**
-   * Open the LevelDB, execute a function, then close it.
+   * Load all LevelDB files from disk into memory.
+   * Can be called multiple times to refresh data.
    */
-  private async withDB<T>(fn: (db: ClassicLevel<Buffer, Buffer>) => Promise<T>): Promise<T> {
-    const db = new ClassicLevel<Buffer, Buffer>(this.dbPath, {
-      keyEncoding: 'buffer',
-      valueEncoding: 'buffer',
-      createIfMissing: false,
-    });
+  async load(): Promise<void> {
+    this.parsedKeys.clear();
+    this.chunkIndex.clear();
+
+    if (!fs.existsSync(this.dbPath)) {
+      this.loaded = true;
+      return;
+    }
+
+    const files = fs.readdirSync(this.dbPath);
+
+    // Parse .ldb/.sst files (sorted tables)
+    for (const file of files) {
+      if (file.endsWith('.ldb') || file.endsWith('.sst')) {
+        const data = fs.readFileSync(path.join(this.dbPath, file));
+        this.parseLDBFile(data);
+      }
+    }
+
+    // Parse .log files (write-ahead log) for most recent data
+    for (const file of files) {
+      if (file.endsWith('.log')) {
+        const data = fs.readFileSync(path.join(this.dbPath, file));
+        this.parseLogFile(data);
+      }
+    }
+
+    this.loaded = true;
+  }
+
+  /**
+   * Ensure data is loaded.
+   */
+  private async ensureLoaded(): Promise<void> {
+    if (!this.loaded) {
+      await this.load();
+    }
+  }
+
+  /**
+   * Close / release resources.
+   */
+  async close(): Promise<void> {
+    this.parsedKeys.clear();
+    this.chunkIndex.clear();
+    this.loaded = false;
+  }
+
+  // ─── LDB (SSTable) Parsing ────────────────────────────────────────────
+
+  private parseLDBFile(data: Buffer): void {
+    if (data.length < 48) return;
 
     try {
-      await db.open();
-      const result = await fn(db);
-      return result;
-    } finally {
+      // Read footer (last 48 bytes)
+      const footerOffset = data.length - 48;
+
+      // Check magic number
+      const magic1 = data.readUInt32LE(footerOffset + 40);
+      const magic2 = data.readUInt32LE(footerOffset + 44);
+      if (magic1 !== 0x8b80fb57 || magic2 !== 0xdb477524) return;
+
+      // Read index block handle from footer
+      let pos = footerOffset;
+      // Skip metaindex handle
+      const { value: _metaOffset, bytesRead: b1 } = this.readVarint(data, pos);
+      pos += b1;
+      const { value: _metaSize, bytesRead: b2 } = this.readVarint(data, pos);
+      pos += b2;
+
+      // Read index handle
+      const { value: indexOffset, bytesRead: b3 } = this.readVarint(data, pos);
+      pos += b3;
+      const { value: indexSize, bytesRead: b4 } = this.readVarint(data, pos);
+      pos += b4;
+
+      if (indexOffset + indexSize > data.length) return;
+      const indexBlock = this.readBlock(data, indexOffset, indexSize);
+      if (!indexBlock) return;
+
+      this.parseIndexBlock(indexBlock, data);
+    } catch {
+      // Silently skip corrupt table files
+    }
+  }
+
+  private readBlock(data: Buffer, offset: number, size: number): Buffer | null {
+    if (offset + size + 1 > data.length) return null;
+    const compressionType = data[offset + size];
+    const raw = data.slice(offset, offset + size);
+
+    if (compressionType === 0) return raw;
+
+    // Try zlib raw inflate then regular inflate
+    try {
+      return Buffer.from(zlib.inflateRawSync(raw));
+    } catch { /* fall through */ }
+    try {
+      return Buffer.from(zlib.inflateSync(raw));
+    } catch { /* fall through */ }
+    return null;
+  }
+
+  private parseIndexBlock(indexBlock: Buffer, fullData: Buffer): void {
+    let pos = 0;
+    let prevKey = Buffer.alloc(0);
+
+    if (indexBlock.length < 4) return;
+    const numRestarts = indexBlock.readUInt32LE(indexBlock.length - 4);
+    const dataEnd = indexBlock.length - 4 - numRestarts * 4;
+
+    while (pos < dataEnd) {
       try {
-        await db.close();
+        const { value: shared, bytesRead: b1 } = this.readVarint(indexBlock, pos);
+        if (shared > prevKey.length) break;
+        pos += b1;
+
+        const { value: unshared, bytesRead: b2 } = this.readVarint(indexBlock, pos);
+        pos += b2;
+
+        const { value: valueLen, bytesRead: b3 } = this.readVarint(indexBlock, pos);
+        pos += b3;
+
+        if (pos + unshared + valueLen > dataEnd) break;
+        if (unshared > 10000 || valueLen > 100) break;
+
+        const key = Buffer.alloc(shared + unshared);
+        prevKey.copy(key, 0, 0, shared);
+        indexBlock.copy(key, shared, pos, pos + unshared);
+        pos += unshared;
+        prevKey = key;
+
+        const handleData = indexBlock.slice(pos, pos + valueLen);
+        pos += valueLen;
+
+        const { value: blockOffset, bytesRead: hb1 } = this.readVarint(handleData, 0);
+        const { value: blockSize } = this.readVarint(handleData, hb1);
+
+        if (blockOffset + blockSize <= fullData.length) {
+          const decompressed = this.readBlock(fullData, blockOffset, blockSize);
+          if (decompressed) {
+            this.parseDataBlock(decompressed);
+          }
+        }
       } catch {
-        // Ignore close errors
+        break;
       }
     }
   }
+
+  private parseDataBlock(block: Buffer): void {
+    let pos = 0;
+    let prevKey = Buffer.alloc(0);
+
+    if (block.length < 4) return;
+    const numRestarts = block.readUInt32LE(block.length - 4);
+    const dataEnd = block.length - 4 - numRestarts * 4;
+
+    while (pos < dataEnd) {
+      try {
+        const { value: shared, bytesRead: b1 } = this.readVarint(block, pos);
+        pos += b1;
+        if (pos >= dataEnd) break;
+
+        const { value: unshared, bytesRead: b2 } = this.readVarint(block, pos);
+        pos += b2;
+        if (pos >= dataEnd) break;
+
+        const { value: valueLen, bytesRead: b3 } = this.readVarint(block, pos);
+        pos += b3;
+
+        if (unshared > 100000 || valueLen > 10000000 || shared > prevKey.length) break;
+        if (pos + unshared + valueLen > dataEnd) break;
+
+        const fullKey = Buffer.alloc(shared + unshared);
+        prevKey.copy(fullKey, 0, 0, shared);
+        block.copy(fullKey, shared, pos, pos + unshared);
+        pos += unshared;
+        prevKey = fullKey;
+
+        const value = block.slice(pos, pos + valueLen);
+        pos += valueLen;
+
+        // Internal key: user_key (N-8 bytes) + sequence|type (8 bytes)
+        if (fullKey.length > 8) {
+          const typeVal = fullKey[fullKey.length - 8] & 0xff;
+          if (typeVal === 1) {
+            const userKey = fullKey.slice(0, fullKey.length - 8);
+            this.storeKey(userKey, value);
+          }
+        }
+      } catch {
+        break;
+      }
+    }
+  }
+
+  // ─── Log (WAL) Parsing ────────────────────────────────────────────────
+
+  private parseLogFile(data: Buffer): void {
+    const BLOCK_SIZE = 32768;
+    let offset = 0;
+
+    while (offset < data.length) {
+      const blockEnd = Math.min(offset + BLOCK_SIZE, data.length);
+      let pos = offset;
+
+      while (pos + 7 <= blockEnd) {
+        const length = data.readUInt16LE(pos + 4);
+        const type = data[pos + 6];
+        pos += 7;
+        if (pos + length > blockEnd) break;
+
+        if (type === 1 || type === 2 || type === 3) {
+          const recordData = data.slice(pos, pos + length);
+          this.parseWriteBatch(recordData);
+        }
+        pos += length;
+      }
+
+      offset = blockEnd;
+    }
+  }
+
+  private parseWriteBatch(data: Buffer): void {
+    if (data.length < 12) return;
+    const count = data.readUInt32LE(8);
+    let pos = 12;
+
+    for (let i = 0; i < count && pos < data.length; i++) {
+      const type = data[pos];
+      pos++;
+
+      if (type === 1) {
+        const { value: keyLen, bytesRead: b1 } = this.readVarint(data, pos);
+        pos += b1;
+        if (pos + keyLen > data.length) break;
+        const key = data.slice(pos, pos + keyLen);
+        pos += keyLen;
+
+        const { value: valLen, bytesRead: b2 } = this.readVarint(data, pos);
+        pos += b2;
+        if (pos + valLen > data.length) break;
+        const value = data.slice(pos, pos + valLen);
+        pos += valLen;
+
+        this.storeKey(key, value);
+      } else if (type === 0) {
+        const { value: keyLen, bytesRead: b1 } = this.readVarint(data, pos);
+        pos += b1;
+        pos += keyLen;
+      } else {
+        break;
+      }
+    }
+  }
+
+  // ─── Key Storage & Indexing ───────────────────────────────────────────
+
+  private storeKey(key: Buffer, value: Buffer): void {
+    const keyHex = key.toString('hex');
+    this.parsedKeys.set(keyHex, value);
+    this.indexChunkKey(key, keyHex);
+  }
+
+  private indexChunkKey(key: Buffer, keyHex: string): void {
+    if (key.length < 9) return;
+
+    const x = key.readInt32LE(0);
+    const z = key.readInt32LE(4);
+
+    // Overworld subchunk key: length 9-14, tag 0x2f at offset 8
+    if (key.length >= 9 && key.length <= 14 && key[8] === 0x2f) {
+      const indexKey = `${x},${z},0`;
+      let set = this.chunkIndex.get(indexKey);
+      if (!set) { set = new Set(); this.chunkIndex.set(indexKey, set); }
+      set.add(keyHex);
+      return;
+    }
+
+    // Other dimensions: length >= 13, dim at offset 8, tag 0x2f at offset 12
+    if (key.length >= 13) {
+      const dim = key.readInt32LE(8);
+      if (key[12] === 0x2f) {
+        const indexKey = `${x},${z},${dim}`;
+        let set = this.chunkIndex.get(indexKey);
+        if (!set) { set = new Set(); this.chunkIndex.set(indexKey, set); }
+        set.add(keyHex);
+      }
+    }
+  }
+
+  private readVarint(data: Buffer, offset: number): { value: number; bytesRead: number } {
+    let result = 0;
+    let shift = 0;
+    let bytesRead = 0;
+    while (offset < data.length) {
+      const b = data[offset];
+      offset++;
+      bytesRead++;
+      result |= (b & 0x7f) << shift;
+      if ((b & 0x80) === 0) break;
+      shift += 7;
+      if (bytesRead > 5) break;
+    }
+    return { value: result >>> 0, bytesRead };
+  }
+
+  // ─── Public API ───────────────────────────────────────────────────────
 
   async getWorldInfo(): Promise<WorldInfo> {
     const levelDatPath = path.join(this.worldPath, 'level.dat');
@@ -59,7 +356,6 @@ export class WorldReader {
   }
 
   private parseLevelDat(data: Buffer): WorldInfo {
-    // Skip 8-byte header (version + length)
     let offset = 8;
     const info: WorldInfo = {
       name: 'Unknown World',
@@ -71,15 +367,12 @@ export class WorldReader {
     };
 
     try {
-      // TAG_Compound
       if (data[offset] !== 10) return info;
       offset++;
 
-      // Root compound name
       const rootNameLen = data.readInt16LE(offset);
       offset += 2 + rootNameLen;
 
-      // Read tags
       while (offset < data.length) {
         const tagType = data[offset];
         offset++;
@@ -97,7 +390,6 @@ export class WorldReader {
         if (tagName === 'GameType' && typeof payload.value === 'number') info.gameType = payload.value;
         if (tagName === 'SpawnX' && typeof payload.value === 'number') info.spawnX = payload.value;
         if (tagName === 'SpawnY' && typeof payload.value === 'number') {
-          // 32767 (0x7FFF) means "auto/surface level" in Bedrock Edition
           info.spawnY = payload.value === 32767 ? 64 : payload.value;
         }
         if (tagName === 'SpawnZ' && typeof payload.value === 'number') info.spawnZ = payload.value;
@@ -112,99 +404,48 @@ export class WorldReader {
     return info;
   }
 
-  private readNBTPayload(tagType: number, data: Buffer, offset: number): { value: unknown; offset: number } | null {
-    if (offset >= data.length) return null;
-
-    switch (tagType) {
-      case 1: return { value: data[offset], offset: offset + 1 };
-      case 2: return { value: data.readInt16LE(offset), offset: offset + 2 };
-      case 3: return { value: data.readInt32LE(offset), offset: offset + 4 };
-      case 4: return { value: data.readBigInt64LE(offset), offset: offset + 8 };
-      case 5: return { value: data.readFloatLE(offset), offset: offset + 4 };
-      case 6: return { value: data.readDoubleLE(offset), offset: offset + 8 };
-      case 7: {
-        const len = data.readInt32LE(offset);
-        return { value: data.slice(offset + 4, offset + 4 + len), offset: offset + 4 + len };
-      }
-      case 8: {
-        const len = data.readInt16LE(offset);
-        return { value: data.slice(offset + 2, offset + 2 + len).toString('utf8'), offset: offset + 2 + len };
-      }
-      case 9: {
-        const listType = data[offset];
-        const listLen = data.readInt32LE(offset + 1);
-        let pos = offset + 5;
-        const list: unknown[] = [];
-        for (let i = 0; i < listLen; i++) {
-          const item = this.readNBTPayload(listType, data, pos);
-          if (!item) break;
-          list.push(item.value);
-          pos = item.offset;
-        }
-        return { value: list, offset: pos };
-      }
-      case 10: {
-        let pos = offset;
-        const compound: Record<string, unknown> = {};
-        while (pos < data.length) {
-          const t = data[pos]; pos++;
-          if (t === 0) break;
-          const nl = data.readInt16LE(pos); pos += 2;
-          const n = data.slice(pos, pos + nl).toString('utf8'); pos += nl;
-          const p = this.readNBTPayload(t, data, pos);
-          if (!p) break;
-          compound[n] = p.value;
-          pos = p.offset;
-        }
-        return { value: compound, offset: pos };
-      }
-      case 11: {
-        const len = data.readInt32LE(offset);
-        return { value: data.slice(offset + 4, offset + 4 + len * 4), offset: offset + 4 + len * 4 };
-      }
-      case 12: {
-        const len = data.readInt32LE(offset);
-        return { value: data.slice(offset + 4, offset + 4 + len * 8), offset: offset + 4 + len * 8 };
-      }
-      default: return null;
-    }
-  }
-
   async getChunks(coords: ChunkCoord[], dimension: number, heightRange: HeightRange): Promise<ChunkRenderData[]> {
-    return this.withDB(async (db) => {
-      const results: ChunkRenderData[] = [];
+    await this.ensureLoaded();
+    const results: ChunkRenderData[] = [];
 
-      for (const coord of coords) {
-        const chunkData = await this.renderChunk(db, coord.x, coord.z, dimension, heightRange);
-        if (chunkData) {
-          results.push(chunkData);
-        }
+    for (const coord of coords) {
+      const chunkData = this.renderChunk(coord.x, coord.z, dimension, heightRange);
+      if (chunkData) {
+        results.push(chunkData);
       }
+    }
 
-      return results;
-    });
+    return results;
   }
 
-  private async renderChunk(
-    db: ClassicLevel<Buffer, Buffer>,
+  private renderChunk(
     chunkX: number,
     chunkZ: number,
     dimension: number,
     heightRange: HeightRange
-  ): Promise<ChunkRenderData | null> {
+  ): ChunkRenderData | null {
+    const indexKey = `${chunkX},${chunkZ},${dimension}`;
+    const chunkKeySet = this.chunkIndex.get(indexKey);
+    if (!chunkKeySet || chunkKeySet.size === 0) return null;
+
     // Collect subchunks
     const subchunks = new Map<number, Buffer>();
 
-    const maxSubchunk = Math.floor(heightRange.max / 16);
-    const minSubchunk = Math.floor(heightRange.min / 16);
+    for (const keyHex of chunkKeySet) {
+      const value = this.parsedKeys.get(keyHex);
+      if (!value) continue;
 
-    for (let sy = minSubchunk; sy <= maxSubchunk; sy++) {
-      const key = this.makeChunkKey(chunkX, chunkZ, dimension, 0x2f, sy);
-      try {
-        const value = await db.get(key);
-        subchunks.set(sy, value);
-      } catch {
-        // Key doesn't exist, skip
+      const key = Buffer.from(keyHex, 'hex');
+      let subchunkIdx: number | undefined;
+
+      if (dimension === 0) {
+        if (key.length >= 10) subchunkIdx = key.readInt8(9);
+      } else {
+        if (key.length >= 14) subchunkIdx = key.readInt8(13);
+      }
+
+      if (subchunkIdx !== undefined) {
+        subchunks.set(subchunkIdx, value);
       }
     }
 
@@ -215,27 +456,6 @@ export class WorldReader {
     this.renderTopDown(subchunks, pixels, heightRange);
 
     return { x: chunkX, z: chunkZ, pixels };
-  }
-
-  private makeChunkKey(x: number, z: number, dimension: number, tag: number, subchunkIdx?: number): Buffer {
-    if (dimension === 0) {
-      // Overworld: x(4) + z(4) + tag(1) [+ subchunk(1)]
-      const buf = Buffer.alloc(subchunkIdx !== undefined ? 10 : 9);
-      buf.writeInt32LE(x, 0);
-      buf.writeInt32LE(z, 4);
-      buf.writeUInt8(tag, 8);
-      if (subchunkIdx !== undefined) buf.writeUInt8(subchunkIdx & 0xff, 9);
-      return buf;
-    } else {
-      // Other: x(4) + z(4) + dim(4) + tag(1) [+ subchunk(1)]
-      const buf = Buffer.alloc(subchunkIdx !== undefined ? 14 : 13);
-      buf.writeInt32LE(x, 0);
-      buf.writeInt32LE(z, 4);
-      buf.writeInt32LE(dimension, 8);
-      buf.writeUInt8(tag, 12);
-      if (subchunkIdx !== undefined) buf.writeUInt8(subchunkIdx & 0xff, 13);
-      return buf;
-    }
   }
 
   private renderTopDown(subchunks: Map<number, Buffer>, pixels: Uint8Array, heightRange: HeightRange): void {
@@ -290,7 +510,6 @@ export class WorldReader {
       const bitsPerBlock = bitsAndFlags >> 1;
 
       if (bitsPerBlock === 0) {
-        // Single block palette
         const paletteSize = data.readInt32LE(offset);
         offset += 4;
         return this.readPaletteEntryName(data, offset);
@@ -376,6 +595,64 @@ export class WorldReader {
     return offset - start;
   }
 
+  private readNBTPayload(tagType: number, data: Buffer, offset: number): { value: unknown; offset: number } | null {
+    if (offset >= data.length) return null;
+
+    switch (tagType) {
+      case 1: return { value: data[offset], offset: offset + 1 };
+      case 2: return { value: data.readInt16LE(offset), offset: offset + 2 };
+      case 3: return { value: data.readInt32LE(offset), offset: offset + 4 };
+      case 4: return { value: data.readBigInt64LE(offset), offset: offset + 8 };
+      case 5: return { value: data.readFloatLE(offset), offset: offset + 4 };
+      case 6: return { value: data.readDoubleLE(offset), offset: offset + 8 };
+      case 7: {
+        const len = data.readInt32LE(offset);
+        return { value: data.slice(offset + 4, offset + 4 + len), offset: offset + 4 + len };
+      }
+      case 8: {
+        const len = data.readInt16LE(offset);
+        return { value: data.slice(offset + 2, offset + 2 + len).toString('utf8'), offset: offset + 2 + len };
+      }
+      case 9: {
+        const listType = data[offset];
+        const listLen = data.readInt32LE(offset + 1);
+        let pos = offset + 5;
+        const list: unknown[] = [];
+        for (let i = 0; i < listLen; i++) {
+          const item = this.readNBTPayload(listType, data, pos);
+          if (!item) break;
+          list.push(item.value);
+          pos = item.offset;
+        }
+        return { value: list, offset: pos };
+      }
+      case 10: {
+        let pos = offset;
+        const compound: Record<string, unknown> = {};
+        while (pos < data.length) {
+          const t = data[pos]; pos++;
+          if (t === 0) break;
+          const nl = data.readInt16LE(pos); pos += 2;
+          const n = data.slice(pos, pos + nl).toString('utf8'); pos += nl;
+          const p = this.readNBTPayload(t, data, pos);
+          if (!p) break;
+          compound[n] = p.value;
+          pos = p.offset;
+        }
+        return { value: compound, offset: pos };
+      }
+      case 11: {
+        const len = data.readInt32LE(offset);
+        return { value: data.slice(offset + 4, offset + 4 + len * 4), offset: offset + 4 + len * 4 };
+      }
+      case 12: {
+        const len = data.readInt32LE(offset);
+        return { value: data.slice(offset + 4, offset + 4 + len * 8), offset: offset + 4 + len * 8 };
+      }
+      default: return null;
+    }
+  }
+
   private skipNBTPayload(tagType: number, data: Buffer, offset: number): number {
     const start = offset;
     switch (tagType) {
@@ -414,10 +691,12 @@ export class WorldReader {
     }
   }
 
+  // ─── Markers ──────────────────────────────────────────────────────────
+
   async getMarkers(enablePortals: boolean, enablePlayers: boolean): Promise<MapMarker[]> {
+    await this.ensureLoaded();
     const markers: MapMarker[] = [];
 
-    // Add spawn/player info
     if (enablePlayers) {
       const info = await this.getWorldInfo();
       markers.push({
@@ -430,75 +709,56 @@ export class WorldReader {
         label: 'World Spawn',
       });
 
-      // Look for local player and multiplayer player data in DB
-      await this.withDB(async (db) => {
-        // Local player
+      // Look for player keys in parsed data
+      for (const [keyHex, value] of this.parsedKeys) {
+        const key = Buffer.from(keyHex, 'hex');
         try {
-          const playerKey = Buffer.from('~local_player');
-          const playerData = await db.get(playerKey);
-          const pos = this.parsePlayerPosition(playerData);
-          if (pos) {
-            markers.push({
-              id: 'local_player',
-              x: Math.floor(pos.x),
-              y: Math.floor(pos.y),
-              z: Math.floor(pos.z),
-              dimension: pos.dimension,
-              type: 'player',
-              label: 'Player',
-            });
-          }
-        } catch {
-          // No local player data
-        }
-
-        // Multiplayer players (keys starting with "player_")
-        try {
-          const iterator = db.iterator();
-          for await (const [key, value] of iterator) {
-            const keyStr = key.toString('utf8');
-            if (keyStr.startsWith('player_')) {
-              const playerId = keyStr.slice('player_'.length);
-              const pos = this.parsePlayerPosition(value);
-              if (pos) {
-                markers.push({
-                  id: `player_${playerId}`,
-                  x: Math.floor(pos.x),
-                  y: Math.floor(pos.y),
-                  z: Math.floor(pos.z),
-                  dimension: pos.dimension,
-                  type: 'player',
-                  label: `Player ${playerId.slice(0, 8)}`,
-                });
-              }
+          const keyStr = key.toString('utf8');
+          if (keyStr === '~local_player') {
+            const pos = this.parsePlayerPosition(value);
+            if (pos) {
+              markers.push({
+                id: 'local_player',
+                x: Math.floor(pos.x),
+                y: Math.floor(pos.y),
+                z: Math.floor(pos.z),
+                dimension: pos.dimension,
+                type: 'player',
+                label: 'Player',
+              });
+            }
+          } else if (keyStr.startsWith('player_')) {
+            const playerId = keyStr.slice('player_'.length);
+            const pos = this.parsePlayerPosition(value);
+            if (pos) {
+              markers.push({
+                id: `player_${playerId}`,
+                x: Math.floor(pos.x),
+                y: Math.floor(pos.y),
+                z: Math.floor(pos.z),
+                dimension: pos.dimension,
+                type: 'player',
+                label: `Player ${playerId.slice(0, 8)}`,
+              });
             }
           }
-          await iterator.close();
         } catch {
-          // Error reading multiplayer data
+          // Not a text key
         }
-      });
+      }
     }
 
-    // Find portals
     if (enablePortals) {
-      await this.withDB(async (db) => {
-        const iterator = db.iterator();
-        try {
-          for await (const [key, value] of iterator) {
-            this.checkForPortalMarker(key, value, markers);
-          }
-        } finally {
-          await iterator.close();
-        }
-      });
+      for (const [keyHex, value] of this.parsedKeys) {
+        const key = Buffer.from(keyHex, 'hex');
+        this.checkForPortalMarker(key, value, markers);
+      }
     }
 
     return markers;
   }
 
   private parsePlayerPosition(data: Buffer): { x: number; y: number; z: number; dimension: number } | null {
-    // Player data is NBT compound with Pos list (3 floats) and DimensionId
     try {
       let offset = 0;
       if (data[offset] !== 10) return null;
@@ -517,7 +777,6 @@ export class WorldReader {
         offset += nameLen;
 
         if (tagType === 9 && tagName === 'Pos') {
-          // List of floats
           const listType = data[offset]; offset++;
           const listLen = data.readInt32LE(offset); offset += 4;
           if (listType === 5 && listLen === 3) {
@@ -565,7 +824,6 @@ export class WorldReader {
       return;
     }
 
-    // Tag 49 (0x31) = BlockEntity
     if (tag !== 0x31) return;
 
     const text = value.toString('utf8');
@@ -601,26 +859,7 @@ export class WorldReader {
   }
 
   async getModifiedChunks(_since: number): Promise<ChunkCoord[]> {
-    // Check DB file modification times
-    try {
-      const files = fs.readdirSync(this.dbPath);
-      const modifiedChunks: ChunkCoord[] = [];
-
-      for (const file of files) {
-        if (file.endsWith('.log')) {
-          const stat = fs.statSync(path.join(this.dbPath, file));
-          if (stat.mtimeMs > _since) {
-            // Log file was modified - we can't easily determine which chunks
-            // For now, signal a generic update
-            modifiedChunks.push({ x: 0, z: 0 }); // Placeholder
-            break;
-          }
-        }
-      }
-
-      return modifiedChunks;
-    } catch {
-      return [];
-    }
+    // With in-memory approach, we detect changes on refresh
+    return [];
   }
 }
