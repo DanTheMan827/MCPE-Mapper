@@ -25,7 +25,7 @@ export const FileDropZone: React.FC<FileDropZoneProps> = ({ onFileLoad, onBacken
     e.preventDefault();
     setDragging(false);
     const file = e.dataTransfer.files[0];
-    if (file && (file.name.endsWith('.mcworld') || file.name.endsWith('.zip'))) {
+    if (file) {
       onFileLoad(file);
     }
   }, [onFileLoad]);
@@ -55,7 +55,6 @@ export const FileDropZone: React.FC<FileDropZoneProps> = ({ onFileLoad, onBacken
       <input
         ref={fileInputRef}
         type="file"
-        accept=".mcworld,.zip"
         style={{ display: 'none' }}
         onChange={handleFileSelect}
       />
@@ -63,7 +62,7 @@ export const FileDropZone: React.FC<FileDropZoneProps> = ({ onFileLoad, onBacken
       {!showBackend ? (
         <>
           <h2>🗺️ MCPE Mapper</h2>
-          <p>Drop a .mcworld file here or click to browse</p>
+          <p>Drop a world file here or click to browse</p>
           {showBackendOption && (
             <p style={{ marginTop: 16, fontSize: 12, color: 'var(--text-secondary)' }}>
               or{' '}
