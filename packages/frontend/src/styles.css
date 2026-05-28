@@ -1,0 +1,292 @@
+:root {
+  --panel-bg: rgba(26, 26, 46, 0.85);
+  --panel-border: rgba(255, 255, 255, 0.1);
+  --accent: #4fc3f7;
+  --accent-dim: rgba(79, 195, 247, 0.3);
+  --text-primary: #e0e0e0;
+  --text-secondary: #a0a0a0;
+  --danger: #ef5350;
+  --success: #66bb6a;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: #1a1a2e;
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app-container {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+/* Map canvas - lowest z-index */
+.map-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+  cursor: grab;
+  touch-action: none;
+}
+
+.map-canvas:active {
+  cursor: grabbing;
+}
+
+/* Controls overlay */
+.controls-panel {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 100;
+  background: var(--panel-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  padding: 16px;
+  min-width: 240px;
+  max-width: 320px;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.controls-panel h3 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.control-group {
+  margin-bottom: 16px;
+}
+
+.control-group label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 4px 0;
+  color: var(--text-primary);
+}
+
+.control-group label input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+}
+
+.control-group .range-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.control-group input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+  margin-top: 4px;
+}
+
+/* File drop zone */
+.file-drop-zone {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 50;
+  background: var(--panel-bg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 2px dashed var(--panel-border);
+  border-radius: 16px;
+  padding: 48px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.file-drop-zone:hover,
+.file-drop-zone.dragging {
+  border-color: var(--accent);
+  background: rgba(79, 195, 247, 0.05);
+}
+
+.file-drop-zone h2 {
+  font-size: 20px;
+  margin-bottom: 8px;
+}
+
+.file-drop-zone p {
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+/* Info panel */
+.info-panel {
+  position: absolute;
+  bottom: 16px;
+  left: 16px;
+  z-index: 100;
+  background: var(--panel-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  padding: 12px 16px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.info-panel .coord {
+  color: var(--text-primary);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+/* Loading indicator */
+.loading-indicator {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  z-index: 100;
+  background: var(--panel-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-size: 12px;
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.loading-indicator .spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--accent-dim);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Toggle button for mobile */
+.controls-toggle {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 101;
+  display: none;
+  background: var(--panel-bg);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: var(--text-primary);
+  font-size: 20px;
+  cursor: pointer;
+}
+
+@media (max-width: 600px) {
+  .controls-toggle {
+    display: block;
+  }
+  .controls-panel {
+    display: none;
+    top: 56px;
+    right: 8px;
+    left: 8px;
+    min-width: unset;
+    max-width: unset;
+  }
+  .controls-panel.open {
+    display: block;
+  }
+}
+
+/* Markers on map */
+.map-marker {
+  position: absolute;
+  z-index: 50;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+
+.map-marker .marker-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid white;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
+}
+
+.map-marker .marker-label {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  white-space: nowrap;
+  font-size: 10px;
+  background: rgba(0, 0, 0, 0.7);
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: white;
+}
+
+.marker-dot.player { background: #4fc3f7; }
+.marker-dot.nether_portal { background: #9c27b0; }
+.marker-dot.end_portal { background: #1a1a2e; border-color: #66bb6a; }
+
+/* Dimension selector */
+.dimension-selector {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.dimension-selector button {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid var(--panel-border);
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 6px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.dimension-selector button.active {
+  background: var(--accent-dim);
+  color: var(--accent);
+  border-color: var(--accent);
+}

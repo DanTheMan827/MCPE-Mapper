@@ -1,0 +1,21 @@
+{
+  "name": "mcpe-mapper",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/shared",
+    "packages/frontend",
+    "packages/backend"
+  ],
+  "scripts": {
+    "dev:frontend": "npm run dev --workspace=packages/frontend",
+    "dev:backend": "npm run dev --workspace=packages/backend",
+    "build:shared": "npm run build --workspace=packages/shared",
+    "build:frontend": "npm run build --workspace=packages/frontend",
+    "build:backend": "npm run build --workspace=packages/backend",
+    "build": "npm run build:shared && npm run build:frontend && npm run build:backend",
+    "test": "npm run test --workspace=packages/frontend && npm run test --workspace=packages/backend",
+    "test:frontend": "npm run test --workspace=packages/frontend",
+    "test:backend": "npm run test --workspace=packages/backend"
+  }
+}
