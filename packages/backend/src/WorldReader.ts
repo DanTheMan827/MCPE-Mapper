@@ -501,6 +501,10 @@ export class WorldReader {
       numStorages = data[1];
       offset = 2;
     }
+    // Version 9 adds an extra subchunk-Y index byte after num_storages (before the first storage).
+    if (version >= 9) {
+      offset = 3;
+    }
 
     if (numStorages < 1) return null;
 

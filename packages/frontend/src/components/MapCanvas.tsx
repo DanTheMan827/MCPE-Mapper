@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useCallback, memo, useMemo } from 'react';
+import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
 import { ViewerConfig, MapMarker, ChunkCoord } from '@mcpe-mapper/shared';
 import { OfflineWorldReader } from '../services/OfflineWorldReader';
 import { BackendService } from '../services/BackendService';
@@ -26,36 +26,6 @@ interface ChunkTileData {
   pixels: Uint8ClampedArray;
 }
 
-/** Individual chunk tile rendered as a canvas element - only re-renders when its pixels change */
-const ChunkTile = memo<{ tile: ChunkTileData }>(({ tile }) => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const imageData = new ImageData(tile.pixels, 16, 16);
-    ctx.putImageData(imageData, 0, 0);
-  }, [tile.pixels]);
-
-  return (
-    <canvas
-      ref={canvasRef}
-      className="map-chunk-tile"
-      width={16}
-      height={16}
-      style={{
-        left: tile.x * CHUNK_SIZE,
-        top: tile.z * CHUNK_SIZE,
-        width: CHUNK_SIZE,
-        height: CHUNK_SIZE,
-      }}
-    />
-  );
-});
-ChunkTile.displayName = 'ChunkTile';
-
 /** Yield control back to the event loop */
 function yieldToMain(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 0));
@@ -69,6 +39,10 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   markers,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  /** Ref to the inner chunk layer div — chunk canvases are appended here imperatively */
+  const chunkLayerRef = useRef<HTMLDivElement>(null);
+  /** Off-DOM canvas pool: keeps canvases alive when culled so they need not be re-drawn */
+  const canvasCache = useRef<Map<string, HTMLCanvasElement>>(new Map());
   const [viewState, setViewState] = useState({
     offsetX: 0,
     offsetY: 0,
@@ -434,6 +408,57 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     return result;
   }, [chunkTiles, offsetX, offsetY, zoom]);
 
+  // Sync the canvas cache with the chunkTiles state.
+  // Creates a canvas and draws pixels once when a new tile is added;
+  // destroys the canvas (removing from DOM too) when a tile is removed.
+  useEffect(() => {
+    // Remove canvases for tiles that are no longer in state
+    for (const [key, canvas] of Array.from(canvasCache.current.entries())) {
+      if (!chunkTiles.has(key)) {
+        canvas.remove();
+        canvasCache.current.delete(key);
+      }
+    }
+    // Create and draw canvases for new tiles (not yet in the cache)
+    for (const [key, tile] of chunkTiles) {
+      if (!canvasCache.current.has(key)) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 16;
+        canvas.height = 16;
+        canvas.className = 'map-chunk-tile';
+        canvas.style.left = `${tile.x * CHUNK_SIZE}px`;
+        canvas.style.top = `${tile.z * CHUNK_SIZE}px`;
+        canvas.style.width = `${CHUNK_SIZE}px`;
+        canvas.style.height = `${CHUNK_SIZE}px`;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.putImageData(new ImageData(tile.pixels, 16, 16), 0, 0);
+        }
+        canvasCache.current.set(key, canvas);
+      }
+    }
+  }, [chunkTiles]);
+
+  // Sync DOM presence of chunk canvases based on which tiles are visible.
+  // Visible canvases are appended to the chunk layer div; non-visible ones
+  // are detached from the DOM but kept alive in canvasCache for fast re-attachment.
+  useEffect(() => {
+    const layer = chunkLayerRef.current;
+    if (!layer) return;
+
+    const visibleKeys = new Set(visibleTiles.map(t => t.key));
+
+    for (const [key, canvas] of canvasCache.current) {
+      if (visibleKeys.has(key)) {
+        if (!canvas.parentElement) {
+          layer.appendChild(canvas);
+        }
+      } else if (canvas.parentElement) {
+        canvas.remove();
+      }
+    }
+  }, [visibleTiles]);
+
   return (
     <div
       ref={containerRef}
@@ -447,18 +472,15 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
     >
-      {/* Chunk layer */}
+      {/* Chunk layer — canvases are managed imperatively via chunkLayerRef */}
       <div
+        ref={chunkLayerRef}
         className="map-chunk-layer"
         style={{
           transform: `translate(${offsetX + (containerRef.current?.clientWidth || 0) / 2}px, ${offsetY + (containerRef.current?.clientHeight || 0) / 2}px) scale(${zoom})`,
           transformOrigin: '0 0',
         }}
       >
-        {visibleTiles.map(tile => (
-          <ChunkTile key={tile.key} tile={tile} />
-        ))}
-
         {/* Markers */}
         {markers.map(marker => (
           <div
