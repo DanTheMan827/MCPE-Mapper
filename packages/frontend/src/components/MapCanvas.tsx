@@ -692,40 +692,30 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
 
   // ─── input handlers ──────────────────────────────────────────────────────────
 
+  const updateCursorPosition = useCallback((clientX: number, clientY: number) => {
+    if (!onCursorPosition) return;
+    const container = containerRef.current;
+    if (!container) return;
+
+    const rect = container.getBoundingClientRect();
+    const { offsetX, offsetY, zoom } = viewStateRef.current;
+    const mx = clientX - rect.left;
+    const my = clientY - rect.top;
+    const worldX = Math.round((mx - container.clientWidth  / 2 - offsetX) / zoom);
+    const worldZ = Math.round((my - container.clientHeight / 2 - offsetY) / zoom);
+    onCursorPosition({ x: worldX, z: worldZ });
+  }, [onCursorPosition]);
+
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
     if (pinchActive.current) return;
     isDragging.current = true;
     lastPointer.current = { x: e.clientX, y: e.clientY };
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
-
-    if (onCursorPosition) {
-      const container = containerRef.current;
-      if (container) {
-        const rect = container.getBoundingClientRect();
-        const { offsetX, offsetY, zoom } = viewStateRef.current;
-        const mx = e.clientX - rect.left;
-        const my = e.clientY - rect.top;
-        const worldX = Math.round((mx - container.clientWidth  / 2 - offsetX) / zoom);
-        const worldZ = Math.round((my - container.clientHeight / 2 - offsetY) / zoom);
-        onCursorPosition({ x: worldX, z: worldZ });
-      }
-    }
-  }, [onCursorPosition]);
+    updateCursorPosition(e.clientX, e.clientY);
+  }, [updateCursorPosition]);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
-    // Update cursor world position
-    if (onCursorPosition) {
-      const container = containerRef.current;
-      if (container) {
-        const rect = container.getBoundingClientRect();
-        const { offsetX, offsetY, zoom } = viewStateRef.current;
-        const mx = e.clientX - rect.left;
-        const my = e.clientY - rect.top;
-        const worldX = Math.round((mx - container.clientWidth  / 2 - offsetX) / zoom);
-        const worldZ = Math.round((my - container.clientHeight / 2 - offsetY) / zoom);
-        onCursorPosition({ x: worldX, z: worldZ });
-      }
-    }
+    updateCursorPosition(e.clientX, e.clientY);
 
     if (!isDragging.current || pinchActive.current) return;
     const dx = e.clientX - lastPointer.current.x;
@@ -736,7 +726,11 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       offsetX: prev.offsetX + dx,
       offsetY: prev.offsetY + dy,
     }));
-  }, [onCursorPosition]);
+  }, [updateCursorPosition]);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    updateCursorPosition(e.clientX, e.clientY);
+  }, [updateCursorPosition]);
 
   const handlePointerUp = useCallback(() => {
     isDragging.current = false;
@@ -827,6 +821,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
       onPointerLeave={handlePointerLeave}
+      onMouseMove={handleMouseMove}
       onWheel={handleWheel}
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}

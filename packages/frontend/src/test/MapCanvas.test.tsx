@@ -141,4 +141,26 @@ describe('MapCanvas', () => {
     );
     expect(onCursorPosition).not.toHaveBeenCalledWith(null);
   });
+
+  it('updates cursor position on mouse move', () => {
+    const onCursorPosition = vi.fn();
+    const { container } = render(
+      <MapCanvas
+        mode="offline"
+        config={mockConfig}
+        offlineReader={null}
+        backendService={null}
+        markers={[]}
+        onCursorPosition={onCursorPosition}
+      />
+    );
+
+    const mapDiv = container.querySelector('.map-canvas') as HTMLElement;
+    fireEvent.mouseMove(mapDiv, { clientX: 80, clientY: 120 });
+
+    expect(onCursorPosition).toHaveBeenCalledTimes(1);
+    expect(onCursorPosition.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ x: expect.any(Number), z: expect.any(Number) })
+    );
+  });
 });
