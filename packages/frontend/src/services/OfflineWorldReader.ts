@@ -624,6 +624,32 @@ export class OfflineWorldReader {
   }
 
   /**
+   * Return the raw subchunk data for a chunk (for worker-based rendering).
+   * Returns a Map of subchunk index → Uint8Array, or null if the chunk has no data.
+   */
+  getChunkSubchunks(chunkX: number, chunkZ: number, dimension: number): Map<number, Uint8Array> | null {
+    const indexKey = `${chunkX},${chunkZ},${dimension}`;
+    const chunkKeySet = this.chunkIndex.get(indexKey);
+    if (!chunkKeySet || chunkKeySet.size === 0) return null;
+
+    const subchunks = new Map<number, Uint8Array>();
+    for (const keyHex of chunkKeySet) {
+      const value = this.parsedKeys.get(keyHex);
+      if (!value) continue;
+      const key = this.hexToBytes(keyHex);
+      let subchunkIdx: number | undefined;
+      if (dimension === 0) {
+        if (key.length >= 10) subchunkIdx = (key[9] << 24) >> 24;
+      } else {
+        if (key.length >= 14) subchunkIdx = (key[13] << 24) >> 24;
+      }
+      if (subchunkIdx !== undefined) subchunks.set(subchunkIdx, value);
+    }
+
+    return subchunks.size > 0 ? subchunks : null;
+  }
+
+  /**
    * Render a chunk as top-down pixel data
    */
   getChunkRender(chunkX: number, chunkZ: number, dimension: number, heightRange: HeightRange): ChunkRenderData | null {
@@ -929,7 +955,7 @@ export class OfflineWorldReader {
   }
 
   /**
-   * Get markers (portals, players) from the world
+   * Get markers (portals, players, banners) from the world
    */
   getMarkers(): MapMarker[] {
     const markers: MapMarker[] = [];
@@ -955,31 +981,31 @@ export class OfflineWorldReader {
       try {
         const keyStr = new TextDecoder().decode(key);
         if (keyStr === '~local_player') {
-          const pos = this.parsePlayerNBT(value);
-          if (pos) {
+          const parsed = this.parsePlayerNBT(value);
+          if (parsed) {
             markers.push({
               id: 'local_player',
-              x: Math.floor(pos.x),
-              y: Math.floor(pos.y),
-              z: Math.floor(pos.z),
-              dimension: pos.dimension,
+              x: Math.floor(parsed.x),
+              y: Math.floor(parsed.y),
+              z: Math.floor(parsed.z),
+              dimension: parsed.dimension,
               type: 'player',
-              label: 'Player',
+              label: parsed.name ?? 'Player',
             });
           }
         } else if (keyStr.startsWith('player_')) {
           // Multiplayer player
           const playerId = keyStr.slice('player_'.length);
-          const pos = this.parsePlayerNBT(value);
-          if (pos) {
+          const parsed = this.parsePlayerNBT(value);
+          if (parsed) {
             markers.push({
               id: `player_${playerId}`,
-              x: Math.floor(pos.x),
-              y: Math.floor(pos.y),
-              z: Math.floor(pos.z),
-              dimension: pos.dimension,
+              x: Math.floor(parsed.x),
+              y: Math.floor(parsed.y),
+              z: Math.floor(parsed.z),
+              dimension: parsed.dimension,
               type: 'player',
-              label: `Player ${playerId.slice(0, 8)}`,
+              label: parsed.name ?? `Player ${playerId.slice(0, 8)}`,
             });
           }
         }
@@ -988,7 +1014,7 @@ export class OfflineWorldReader {
       }
     }
 
-    // Look for portal blocks in parsed data
+    // Look for portal blocks and banners in block entity data
     for (const [keyHex, value] of this.parsedKeys) {
       const key = this.hexToBytes(keyHex);
       if (key.length < 9) continue;
@@ -1013,13 +1039,14 @@ export class OfflineWorldReader {
       // Tag 49 (0x31) = BlockEntity data
       if (tag === 0x31) {
         this.extractPortalMarkers(value, kx, kz, dim, markers);
+        this.extractBannerMarkers(value, kx, kz, dim, markers);
       }
     }
 
     return markers;
   }
 
-  private parsePlayerNBT(data: Uint8Array): { x: number; y: number; z: number; dimension: number } | null {
+  private parsePlayerNBT(data: Uint8Array): { x: number; y: number; z: number; dimension: number; name?: string } | null {
     try {
       if (data.length < 3 || data[0] !== 10) return null;
       const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
@@ -1030,6 +1057,7 @@ export class OfflineWorldReader {
 
       let x = 0, y = 0, z = 0, dimension = 0;
       let foundPos = false;
+      let name: string | undefined;
 
       while (offset < data.length) {
         const tagType = data[offset]; offset++;
@@ -1057,6 +1085,11 @@ export class OfflineWorldReader {
           }
         } else if (tagType === 3 && tagName === 'DimensionId') {
           dimension = view.getInt32(offset, true); offset += 4;
+        } else if (tagType === 8 && (tagName === 'Username' || tagName === 'Name')) {
+          const strLen = view.getInt16(offset, true); offset += 2;
+          const candidate = new TextDecoder().decode(data.slice(offset, offset + strLen));
+          offset += strLen;
+          if (!name) name = candidate;
         } else {
           const skip = this.skipNBTPayload(tagType, data, offset);
           if (skip < 0) return null;
@@ -1064,7 +1097,7 @@ export class OfflineWorldReader {
         }
       }
 
-      if (foundPos) return { x, y, z, dimension };
+      if (foundPos) return { x, y, z, dimension, name };
     } catch {
       // Parse error
     }
@@ -1097,6 +1130,78 @@ export class OfflineWorldReader {
         type: 'end_portal',
         label: 'End Portal',
       });
+    }
+  }
+  private extractBannerMarkers(data: Uint8Array, chunkX: number, chunkZ: number, dimension: number, markers: MapMarker[]): void {
+    // Banners have id == "Banner" in their block entity NBT
+    const text = new TextDecoder('utf-8', { fatal: false }).decode(data);
+    if (!text.includes('Banner')) return;
+
+    try {
+      if (data.length < 3 || data[0] !== 10) return;
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+      let offset = 1;
+      const rootNameLen = view.getInt16(offset, true);
+      offset += 2 + rootNameLen;
+
+      let bx = chunkX * 16, by = 64, bz = chunkZ * 16;
+      let id = '';
+      let customName: string | undefined;
+
+      while (offset < data.length) {
+        const tagType = data[offset]; offset++;
+        if (tagType === 0) break;
+
+        const nameLen = view.getInt16(offset, true); offset += 2;
+        const tagName = new TextDecoder().decode(data.slice(offset, offset + nameLen));
+        offset += nameLen;
+
+        if (tagType === 3 && tagName === 'x') {
+          bx = view.getInt32(offset, true); offset += 4;
+        } else if (tagType === 3 && tagName === 'y') {
+          by = view.getInt32(offset, true); offset += 4;
+        } else if (tagType === 3 && tagName === 'z') {
+          bz = view.getInt32(offset, true); offset += 4;
+        } else if (tagType === 8 && tagName === 'id') {
+          const strLen = view.getInt16(offset, true); offset += 2;
+          id = new TextDecoder().decode(data.slice(offset, offset + strLen));
+          offset += strLen;
+        } else if (tagType === 8 && tagName === 'CustomName') {
+          const strLen = view.getInt16(offset, true); offset += 2;
+          const raw = new TextDecoder().decode(data.slice(offset, offset + strLen));
+          offset += strLen;
+          // CustomName can be a JSON text component like {"text":"My Banner"}
+          try {
+            const parsed = JSON.parse(raw) as { text?: string };
+            if (typeof parsed.text === 'string') {
+              customName = parsed.text;
+            } else {
+              customName = raw;
+            }
+          } catch {
+            customName = raw;
+          }
+        } else {
+          const skip = this.skipNBTPayload(tagType, data, offset);
+          if (skip < 0) return;
+          offset += skip;
+        }
+      }
+
+      if (id === 'Banner' && customName) {
+        markers.push({
+          id: `banner_${bx}_${by}_${bz}_${dimension}`,
+          x: bx,
+          y: by,
+          z: bz,
+          dimension,
+          type: 'banner',
+          label: customName,
+        });
+      }
+    } catch {
+      // Parse error — ignore
     }
   }
 

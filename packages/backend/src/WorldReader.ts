@@ -719,30 +719,30 @@ export class WorldReader {
         try {
           const keyStr = key.toString('utf8');
           if (keyStr === '~local_player') {
-            const pos = this.parsePlayerPosition(value);
-            if (pos) {
+            const parsed = this.parsePlayerPosition(value);
+            if (parsed) {
               markers.push({
                 id: 'local_player',
-                x: Math.floor(pos.x),
-                y: Math.floor(pos.y),
-                z: Math.floor(pos.z),
-                dimension: pos.dimension,
+                x: Math.floor(parsed.x),
+                y: Math.floor(parsed.y),
+                z: Math.floor(parsed.z),
+                dimension: parsed.dimension,
                 type: 'player',
-                label: 'Player',
+                label: parsed.name ?? 'Player',
               });
             }
           } else if (keyStr.startsWith('player_')) {
             const playerId = keyStr.slice('player_'.length);
-            const pos = this.parsePlayerPosition(value);
-            if (pos) {
+            const parsed = this.parsePlayerPosition(value);
+            if (parsed) {
               markers.push({
                 id: `player_${playerId}`,
-                x: Math.floor(pos.x),
-                y: Math.floor(pos.y),
-                z: Math.floor(pos.z),
-                dimension: pos.dimension,
+                x: Math.floor(parsed.x),
+                y: Math.floor(parsed.y),
+                z: Math.floor(parsed.z),
+                dimension: parsed.dimension,
                 type: 'player',
-                label: `Player ${playerId.slice(0, 8)}`,
+                label: parsed.name ?? `Player ${playerId.slice(0, 8)}`,
               });
             }
           }
@@ -756,13 +756,14 @@ export class WorldReader {
       for (const [keyHex, value] of this.parsedKeys) {
         const key = Buffer.from(keyHex, 'hex');
         this.checkForPortalMarker(key, value, markers);
+        this.checkForBannerMarker(key, value, markers);
       }
     }
 
     return markers;
   }
 
-  private parsePlayerPosition(data: Buffer): { x: number; y: number; z: number; dimension: number } | null {
+  private parsePlayerPosition(data: Buffer): { x: number; y: number; z: number; dimension: number; name?: string } | null {
     try {
       let offset = 0;
       if (data[offset] !== 10) return null;
@@ -772,6 +773,7 @@ export class WorldReader {
 
       let x = 0, y = 0, z = 0, dimension = 0;
       let foundPos = false;
+      let name: string | undefined;
 
       while (offset < data.length) {
         const tagType = data[offset]; offset++;
@@ -797,6 +799,10 @@ export class WorldReader {
           }
         } else if (tagType === 3 && tagName === 'DimensionId') {
           dimension = data.readInt32LE(offset); offset += 4;
+        } else if (tagType === 8 && (tagName === 'Username' || tagName === 'Name')) {
+          const strLen = data.readInt16LE(offset); offset += 2;
+          if (!name) name = data.slice(offset, offset + strLen).toString('utf8');
+          offset += strLen;
         } else {
           const skip = this.skipNBTPayload(tagType, data, offset);
           if (skip < 0) return null;
@@ -804,7 +810,7 @@ export class WorldReader {
         }
       }
 
-      if (foundPos) return { x, y, z, dimension };
+      if (foundPos) return { x, y, z, dimension, name };
     } catch {
       // Parse error
     }
@@ -862,8 +868,89 @@ export class WorldReader {
     }
   }
 
-  async getModifiedChunks(_since: number): Promise<ChunkCoord[]> {
-    // With in-memory approach, we detect changes on refresh
-    return [];
+  private checkForBannerMarker(key: Buffer, value: Buffer, markers: MapMarker[]): void {
+    if (key.length < 9) return;
+
+    const kx = key.readInt32LE(0);
+    const kz = key.readInt32LE(4);
+    let tag: number;
+    let dim = 0;
+
+    if (key.length === 9 || key.length === 10) {
+      tag = key[8];
+    } else if (key.length >= 13) {
+      dim = key.readInt32LE(8);
+      tag = key[12];
+    } else {
+      return;
+    }
+
+    if (tag !== 0x31) return;
+
+    const text = value.toString('utf8');
+    if (!text.includes('Banner')) return;
+
+    try {
+      let offset = 0;
+      if (value[offset] !== 10) return;
+      offset++;
+      const rootNameLen = value.readInt16LE(offset);
+      offset += 2 + rootNameLen;
+
+      let bx = kx * 16, by = 64, bz = kz * 16;
+      let id = '';
+      let customName: string | undefined;
+
+      while (offset < value.length) {
+        const tagType = value[offset]; offset++;
+        if (tagType === 0) break;
+        const nameLen = value.readInt16LE(offset); offset += 2;
+        const tagName = value.slice(offset, offset + nameLen).toString('utf8');
+        offset += nameLen;
+
+        if (tagType === 3 && tagName === 'x') {
+          bx = value.readInt32LE(offset); offset += 4;
+        } else if (tagType === 3 && tagName === 'y') {
+          by = value.readInt32LE(offset); offset += 4;
+        } else if (tagType === 3 && tagName === 'z') {
+          bz = value.readInt32LE(offset); offset += 4;
+        } else if (tagType === 8 && tagName === 'id') {
+          const strLen = value.readInt16LE(offset); offset += 2;
+          id = value.slice(offset, offset + strLen).toString('utf8');
+          offset += strLen;
+        } else if (tagType === 8 && tagName === 'CustomName') {
+          const strLen = value.readInt16LE(offset); offset += 2;
+          const raw = value.slice(offset, offset + strLen).toString('utf8');
+          offset += strLen;
+          try {
+            const parsed = JSON.parse(raw) as { text?: string };
+            customName = typeof parsed.text === 'string' ? parsed.text : raw;
+          } catch {
+            customName = raw;
+          }
+        } else {
+          const skip = this.skipNBTPayload(tagType, value, offset);
+          if (skip < 0) return;
+          offset += skip;
+        }
+      }
+
+      if (id === 'Banner' && customName) {
+        const markerId = `banner_${bx}_${by}_${bz}_${dim}`;
+        if (!markers.some(m => m.id === markerId)) {
+          markers.push({
+            id: markerId,
+            x: bx,
+            y: by,
+            z: bz,
+            dimension: dim,
+            type: 'banner',
+            label: customName,
+          });
+        }
+      }
+    } catch {
+      // Parse error — ignore
+    }
   }
 }

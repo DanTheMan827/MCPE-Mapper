@@ -1,8 +1,26 @@
-import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
-import { ViewerConfig, MapMarker, ChunkCoord } from '@mcpe-mapper/shared';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
+import { ViewerConfig, MapMarker, ChunkCoord, ChunkRenderData } from '@mcpe-mapper/shared';
 import { OfflineWorldReader } from '../services/OfflineWorldReader';
 import { BackendService } from '../services/BackendService';
 import { AppMode } from '../App';
+import { tileCache, fnv1a } from '../services/TileCache';
+import type { TileRenderRequest, TileRenderResponse } from '../workers/tileWorker';
+
+// ─── constants ────────────────────────────────────────────────────────────────
+
+/** Chunks per tile edge (tile = TILE_SIZE×TILE_SIZE chunks = 256×256 blocks) */
+const TILE_SIZE = 16;
+const CHUNK_SIZE = 16;
+/** Pixel dimensions of one rendered tile canvas */
+const TILE_PIXEL_SIZE = TILE_SIZE * CHUNK_SIZE;
+const MAX_WORKERS = 4;
+const MIN_ZOOM = 0.25;
+const MAX_ZOOM = 32;
+const DEFAULT_ZOOM = 2;
+/** Tiles to render per main-thread batch when workers unavailable */
+const FALLBACK_BATCH_SIZE = 4;
+
+// ─── types ────────────────────────────────────────────────────────────────────
 
 interface MapCanvasProps {
   mode: AppMode;
@@ -10,26 +28,56 @@ interface MapCanvasProps {
   offlineReader: OfflineWorldReader | null;
   backendService: BackendService | null;
   markers: MapMarker[];
+  onCursorPosition?: (pos: { x: number; z: number } | null) => void;
 }
 
-const CHUNK_SIZE = 16;
-const MIN_ZOOM = 0.25;
-const MAX_ZOOM = 32;
-/** Number of chunks to process per batch before yielding to the event loop */
-const CHUNK_BATCH_SIZE = 8;
+interface WorkerEntry {
+  worker: Worker;
+  busy: boolean;
+}
 
-
-interface ChunkTileData {
+interface TileJob {
   key: string;
-  x: number;
-  z: number;
-  pixels: ImageDataArray;
+  generation: number;
+  request: TileRenderRequest;
+  dimension: number;
+  heightMin: number;
+  heightMax: number;
 }
 
-/** Yield control back to the event loop */
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+function tileKey(tileX: number, tileZ: number): string {
+  return `${tileX},${tileZ}`;
+}
+
+function emptyKey(dimension: number, tileX: number, tileZ: number): string {
+  return `${dimension}:${tileX}:${tileZ}`;
+}
+
 function yieldToMain(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 0));
 }
+
+function createTileCanvas(tileX: number, tileZ: number, pixels: Uint8ClampedArray<ArrayBuffer>): HTMLCanvasElement {
+  const canvas = document.createElement('canvas');
+  canvas.width = TILE_PIXEL_SIZE;
+  canvas.height = TILE_PIXEL_SIZE;
+  canvas.className = 'map-chunk-tile';
+  canvas.style.position = 'absolute';
+  canvas.style.left = `${tileX * TILE_PIXEL_SIZE}px`;
+  canvas.style.top = `${tileZ * TILE_PIXEL_SIZE}px`;
+  canvas.style.width = `${TILE_PIXEL_SIZE}px`;
+  canvas.style.height = `${TILE_PIXEL_SIZE}px`;
+  canvas.style.imageRendering = 'pixelated';
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    ctx.putImageData(new ImageData(pixels, TILE_PIXEL_SIZE, TILE_PIXEL_SIZE), 0, 0);
+  }
+  return canvas;
+}
+
+// ─── component ────────────────────────────────────────────────────────────────
 
 export const MapCanvas: React.FC<MapCanvasProps> = ({
   mode,
@@ -37,252 +85,597 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   offlineReader,
   backendService,
   markers,
+  onCursorPosition,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  /** Ref to the inner chunk layer div — chunk canvases are appended here imperatively */
   const chunkLayerRef = useRef<HTMLDivElement>(null);
-  /** Off-DOM canvas pool: keeps canvases alive when culled so they need not be re-drawn */
-  const canvasCache = useRef<Map<string, HTMLCanvasElement>>(new Map());
+
   const [viewState, setViewState] = useState({
     offsetX: 0,
     offsetY: 0,
-    zoom: 2,
+    zoom: DEFAULT_ZOOM,
   });
-  const [chunkTiles, setChunkTiles] = useState<Map<string, ChunkTileData>>(new Map());
-  const pendingChunks = useRef<Set<string>>(new Set());
-  /** Tracks chunks that returned no data so we don't re-request them */
-  const emptyChunks = useRef<Set<string>>(new Set());
+
+  // Keep a ref in sync so async callbacks always see current values
+  const viewStateRef = useRef(viewState);
+  viewStateRef.current = viewState;
+  const configRef = useRef(config);
+  configRef.current = config;
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+  const offlineReaderRef = useRef(offlineReader);
+  offlineReaderRef.current = offlineReader;
+  const backendServiceRef = useRef(backendService);
+  backendServiceRef.current = backendService;
+
+  // Per-dimension in-memory tile canvas cache: dimension → tileKey → canvas
+  // Preserved across dimension switches so switching back is instant.
+  const tileCacheByDim = useRef<Map<number, Map<string, HTMLCanvasElement>>>(new Map());
+
+  // Worker pool (created once, reused)
+  const workerPool = useRef<WorkerEntry[]>([]);
+  const workersAvailable = useRef(false);
+
+  // Job queue for when all workers are busy
+  const jobQueue = useRef<TileJob[]>([]);
+
+  // Set of tile keys (tileKey(tx,tz)) currently being rendered (in-flight)
+  const pendingTileKeys = useRef<Set<string>>(new Set());
+
+  // Empty tile tracking: tiles that have no chunk data at all (skip re-requesting)
+  // Key: emptyKey(dimension, tileX, tileZ)
+  const emptyTileKeys = useRef<Set<string>>(new Set());
+
+  // Canvases currently in the DOM (visible layer)
+  const visibleCanvases = useRef<Map<string, HTMLCanvasElement>>(new Map());
+
+  // Generation counter — incrementing cancels all in-flight work
+  const loadGeneration = useRef(0);
+
+  // Pointer interaction state
   const isDragging = useRef(false);
   const lastPointer = useRef({ x: 0, y: 0 });
   const pinchDistance = useRef<number | null>(null);
   const pinchActive = useRef(false);
-  const activeTouches = useRef(0);
-  /** Cancellation flag for in-progress chunk loading */
-  const loadGeneration = useRef(0);
-  /** Whether a load task is currently running */
-  const loadRunning = useRef(false);
-  /** Pending load request to run after current one finishes */
-  const pendingLoad = useRef(false);
 
-  // Load chunks that are visible (and would be visible when zooming out)
-  const loadVisibleChunks = useCallback(async () => {
-    // Only allow one rendering task at a time
-    if (loadRunning.current) {
-      pendingLoad.current = true;
-      return;
+  // ─── worker management ──────────────────────────────────────────────────────
+
+  // Stable ref to the response handler so worker onmessage closures stay valid
+  const handleWorkerResponseRef = useRef<(resp: TileRenderResponse, entry: WorkerEntry) => void>(
+    () => {}
+  );
+
+  const assignNextJobRef = useRef<() => void>(() => {});
+
+  // Initialize workers once
+  useEffect(() => {
+    try {
+      if (typeof Worker === 'undefined') throw new Error('Worker API unavailable');
+
+      for (let i = 0; i < MAX_WORKERS; i++) {
+        const entry: WorkerEntry = { worker: null as unknown as Worker, busy: false };
+        const worker = new Worker(
+          new URL('../workers/tileWorker.ts', import.meta.url),
+          { type: 'module' }
+        );
+        entry.worker = worker;
+
+        worker.onmessage = (e: MessageEvent<TileRenderResponse>) => {
+          entry.busy = false;
+          handleWorkerResponseRef.current(e.data, entry);
+          assignNextJobRef.current();
+        };
+
+        worker.onerror = () => {
+          entry.busy = false;
+          assignNextJobRef.current();
+        };
+
+        workerPool.current.push(entry);
+      }
+      workersAvailable.current = true;
+    } catch {
+      workersAvailable.current = false;
     }
-    loadRunning.current = true;
-    pendingLoad.current = false;
 
-    const container = containerRef.current;
-    if (!container) {
-      loadRunning.current = false;
-      return;
+    return () => {
+      for (const e of workerPool.current) e.worker.terminate();
+      workerPool.current = [];
+      workersAvailable.current = false;
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ─── tile DOM helpers ────────────────────────────────────────────────────────
+
+  /** Append a tile canvas to the chunk layer if it is not already attached */
+  const attachTile = useCallback((key: string, canvas: HTMLCanvasElement) => {
+    const layer = chunkLayerRef.current;
+    if (!layer) return;
+    if (!canvas.parentElement) {
+      layer.appendChild(canvas);
     }
+    visibleCanvases.current.set(key, canvas);
+  }, []);
 
-    const generation = ++loadGeneration.current;
+  /** Remove all tile canvases from DOM but keep them in the dimension cache */
+  const clearDom = useCallback(() => {
+    for (const canvas of visibleCanvases.current.values()) {
+      canvas.remove();
+    }
+    visibleCanvases.current.clear();
+  }, []);
 
-    const { offsetX, offsetY, zoom } = viewState;
-    const width = container.clientWidth;
-    const height = container.clientHeight;
+  // ─── worker response handler (kept in ref for stability) ────────────────────
 
-    // Use a lower zoom (more zoomed out) to pre-render tiles that would
-    // become visible when zooming out
-    const effectiveZoom = Math.max(MIN_ZOOM, zoom * 0.5);
-    const pixelSize = CHUNK_SIZE * effectiveZoom;
-    const startChunkX = Math.floor((-offsetX - width / 2) / pixelSize) - 1;
-    const endChunkX = Math.ceil((-offsetX + width / 2) / pixelSize) + 1;
-    const startChunkZ = Math.floor((-offsetY - height / 2) / pixelSize) - 1;
-    const endChunkZ = Math.ceil((-offsetY + height / 2) / pixelSize) + 1;
+  useEffect(() => {
+    handleWorkerResponseRef.current = (resp: TileRenderResponse, _entry: WorkerEntry) => {
+      const { id, tileX, tileZ, pixels: pixelsBuf, hash } = resp;
 
-    // Center chunk for distance sorting
-    const centerChunkX = -offsetX / (CHUNK_SIZE * zoom);
-    const centerChunkZ = -offsetY / (CHUNK_SIZE * zoom);
+      // Decode job context from id: "generation:dimension:heightMin:heightMax:tileX:tileZ"
+      const parts = id.split(':');
+      const jobGen    = parseInt(parts[0], 10);
+      const dimension = parseInt(parts[1], 10);
+      const heightMin = parseInt(parts[2], 10);
+      const heightMax = parseInt(parts[3], 10);
 
-    const chunksToLoad: ChunkCoord[] = [];
+      const key = tileKey(tileX, tileZ);
+      pendingTileKeys.current.delete(key);
 
-    for (let cx = startChunkX; cx <= endChunkX; cx++) {
-      for (let cz = startChunkZ; cz <= endChunkZ; cz++) {
-        const key = `${cx},${cz},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
-        // Skip if already rendered, already pending, or previously returned empty
-        if (pendingChunks.current.has(key) || emptyChunks.current.has(key)) {
-          continue;
+      // Discard if this load has been superseded
+      if (jobGen !== loadGeneration.current) return;
+
+      const pixels = new Uint8ClampedArray(pixelsBuf);
+      const canvas = createTileCanvas(tileX, tileZ, pixels);
+
+      // Store in in-memory dimension cache
+      const dimMap = tileCacheByDim.current.get(dimension) ?? new Map();
+      tileCacheByDim.current.set(dimension, dimMap);
+      dimMap.set(key, canvas);
+
+      // Save to IndexedDB (best-effort, async)
+      tileCache.put(dimension, heightMin, heightMax, tileX, tileZ, pixels, hash);
+
+      // Add to DOM if this is the currently-viewed dimension
+      if (dimension === configRef.current.dimension) {
+        attachTile(key, canvas);
+      }
+    };
+  }); // No deps — runs every render, keeping the ref current
+
+  // ─── job queue assignment ────────────────────────────────────────────────────
+
+  useEffect(() => {
+    assignNextJobRef.current = () => {
+      // Drain stale jobs from the front of the queue
+      while (jobQueue.current.length > 0 &&
+             jobQueue.current[0].generation !== loadGeneration.current) {
+        const stale = jobQueue.current.shift()!;
+        pendingTileKeys.current.delete(stale.key);
+      }
+
+      const job = jobQueue.current.shift();
+      if (!job) return;
+
+      const idleWorker = workerPool.current.find(w => !w.busy);
+      if (!idleWorker) {
+        // No idle worker — put job back
+        jobQueue.current.unshift(job);
+        return;
+      }
+
+      idleWorker.busy = true;
+      idleWorker.worker.postMessage(job.request);
+    };
+  }); // No deps — runs every render
+
+  // ─── collect subchunk data for a tile (offline mode) ────────────────────────
+
+  /**
+   * Gather subchunk buffers for all chunks in a tile from the offline reader.
+   * Returns null if no chunk in the tile has any data.
+   */
+  const collectTileChunks = useCallback((
+    tileX: number,
+    tileZ: number,
+    dimension: number,
+  ): TileRenderRequest['chunks'] | null => {
+    const reader = offlineReaderRef.current;
+    if (!reader) return null;
+
+    const chunks: TileRenderRequest['chunks'] = [];
+    const baseCX = tileX * TILE_SIZE;
+    const baseCZ = tileZ * TILE_SIZE;
+
+    for (let lx = 0; lx < TILE_SIZE; lx++) {
+      for (let lz = 0; lz < TILE_SIZE; lz++) {
+        const cx = baseCX + lx;
+        const cz = baseCZ + lz;
+        if (!reader.hasChunk(cx, cz, dimension)) continue;
+        const subchunkMap = reader.getChunkSubchunks(cx, cz, dimension);
+        if (!subchunkMap) continue;
+
+        const subchunks: { index: number; data: ArrayBuffer }[] = [];
+        for (const [idx, buf] of subchunkMap) {
+          // Structured-clone the buffer so the worker gets its own copy
+          // (avoids detaching the reader's internal cache buffers)
+          const raw = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+          subchunks.push({ index: idx, data: raw as ArrayBuffer });
         }
-        // Check if already in tile state
-        if (chunkTiles.has(key)) continue;
-        // Skip chunks that don't exist in the offline database
-        if (mode === 'offline' && offlineReader && !offlineReader.hasChunk(cx, cz, config.dimension)) {
-          emptyChunks.current.add(key);
-          continue;
-        }
-        chunksToLoad.push({ x: cx, z: cz });
-        pendingChunks.current.add(key);
+        chunks.push({ chunkLocalX: lx, chunkLocalZ: lz, subchunks });
       }
     }
 
-    if (chunksToLoad.length === 0) {
-      loadRunning.current = false;
-      // If a new request came in while we were checking, run it
-      if (pendingLoad.current) {
-        pendingLoad.current = false;
-        loadVisibleChunks();
-      }
-      return;
-    }
+    return chunks.length > 0 ? chunks : null;
+  }, []);
 
-    // Sort chunks from closest to center going outward
-    chunksToLoad.sort((a, b) => {
-      const distA = (a.x - centerChunkX) ** 2 + (a.z - centerChunkZ) ** 2;
-      const distB = (b.x - centerChunkX) ** 2 + (b.z - centerChunkZ) ** 2;
-      return distA - distB;
-    });
+  // ─── fallback: render tile on main thread without workers ────────────────────
 
-    if (mode === 'offline' && offlineReader) {
-      // Process in small batches, yielding to the event loop between batches
-      for (let i = 0; i < chunksToLoad.length; i += CHUNK_BATCH_SIZE) {
-        // Check if this load has been superseded
-        if (loadGeneration.current !== generation) break;
+  /**
+   * Main-thread tile rendering path used when web workers are unavailable
+   * (e.g., test environment). Calls getChunkRender per chunk.
+   */
+  const renderTileFallback = useCallback((
+    tileX: number,
+    tileZ: number,
+    dimension: number,
+    heightRange: { min: number; max: number },
+  ): HTMLCanvasElement | null => {
+    const reader = offlineReaderRef.current;
+    if (!reader) return null;
 
-        const batch = chunksToLoad.slice(i, i + CHUNK_BATCH_SIZE);
-        const newTiles = new Map<string, ChunkTileData>();
+    const pixels = new Uint8ClampedArray(TILE_PIXEL_SIZE * TILE_PIXEL_SIZE * 4);
+    const baseCX = tileX * TILE_SIZE;
+    const baseCZ = tileZ * TILE_SIZE;
+    let hasAny = false;
 
-        for (const coord of batch) {
-          const key = `${coord.x},${coord.z},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
-          const chunkData = offlineReader.getChunkRender(
-            coord.x,
-            coord.z,
-            config.dimension,
-            config.heightRange
-          );
-          if (chunkData) {
-            const pixels = new Uint8ClampedArray(chunkData.pixels);
-            newTiles.set(key, { key, x: coord.x, z: coord.z, pixels });
-          } else {
-            emptyChunks.current.add(key);
-          }
-          pendingChunks.current.delete(key);
-        }
-
-        // Merge batch results into state
-        if (newTiles.size > 0) {
-          setChunkTiles(prev => {
-            const updated = new Map(prev);
-            for (const [k, v] of newTiles) {
-              updated.set(k, v);
-            }
-            return updated;
-          });
-        }
-
-        // Yield to the event loop to prevent hanging
-        if (i + CHUNK_BATCH_SIZE < chunksToLoad.length) {
-          await yieldToMain();
-        }
-      }
-    } else if (mode === 'backend' && backendService) {
-      const batchSize = 32;
-      for (let i = 0; i < chunksToLoad.length; i += batchSize) {
-        if (loadGeneration.current !== generation) break;
-
-        const batch = chunksToLoad.slice(i, i + batchSize);
+    for (let lx = 0; lx < TILE_SIZE; lx++) {
+      for (let lz = 0; lz < TILE_SIZE; lz++) {
+        const cx = baseCX + lx;
+        const cz = baseCZ + lz;
+        if (!reader.hasChunk(cx, cz, dimension)) continue;
         try {
-          const chunkDataList = await backendService.getChunks(
-            batch,
-            config.dimension,
-            config.heightRange
-          );
+          const chunkData = reader.getChunkRender(cx, cz, dimension, heightRange);
+          if (!chunkData) continue;
+          hasAny = true;
 
-          if (loadGeneration.current !== generation) break;
-
-          const newTiles = new Map<string, ChunkTileData>();
-          const returnedKeys = new Set<string>();
-
-          for (const chunkData of chunkDataList) {
-            const key = `${chunkData.x},${chunkData.z},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
-            const pixels = new Uint8ClampedArray(chunkData.pixels);
-            newTiles.set(key, { key, x: chunkData.x, z: chunkData.z, pixels });
-            pendingChunks.current.delete(key);
-            returnedKeys.add(key);
-          }
-
-          for (const coord of batch) {
-            const key = `${coord.x},${coord.z},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
-            if (!returnedKeys.has(key)) {
-              emptyChunks.current.add(key);
-              pendingChunks.current.delete(key);
+          const srcPx = new Uint8ClampedArray(chunkData.pixels);
+          const dstBaseX = lx * CHUNK_SIZE;
+          const dstBaseZ = lz * CHUNK_SIZE;
+          for (let bx = 0; bx < CHUNK_SIZE; bx++) {
+            for (let bz = 0; bz < CHUNK_SIZE; bz++) {
+              const srcIdx = (bz * CHUNK_SIZE + bx) * 4;
+              const dstIdx = ((dstBaseZ + bz) * TILE_PIXEL_SIZE + (dstBaseX + bx)) * 4;
+              pixels[dstIdx]     = srcPx[srcIdx];
+              pixels[dstIdx + 1] = srcPx[srcIdx + 1];
+              pixels[dstIdx + 2] = srcPx[srcIdx + 2];
+              pixels[dstIdx + 3] = srcPx[srcIdx + 3];
             }
-          }
-
-          if (newTiles.size > 0) {
-            setChunkTiles(prev => {
-              const updated = new Map(prev);
-              for (const [k, v] of newTiles) {
-                updated.set(k, v);
-              }
-              return updated;
-            });
           }
         } catch (err) {
-          console.error('Failed to load chunks:', err);
-          for (const coord of batch) {
-            const key = `${coord.x},${coord.z},${config.dimension},${config.heightRange.min},${config.heightRange.max}`;
-            pendingChunks.current.delete(key);
-          }
+          console.error(`Chunk render error at tile (${tileX}, ${tileZ}), chunk (${cx}, ${cz}):`, err);
         }
       }
     }
 
-    loadRunning.current = false;
-    // If a new load was requested while this one was running, start it
-    if (pendingLoad.current) {
-      pendingLoad.current = false;
-      loadVisibleChunks();
-    }
-  }, [mode, offlineReader, backendService, config, viewState, chunkTiles]);
+    if (!hasAny) return null;
+    return createTileCanvas(tileX, tileZ, pixels);
+  }, []);
 
-  // Clear cache when config changes
+  // ─── core: load visible tiles ────────────────────────────────────────────────
+
+  const loadVisibleTilesRef = useRef<() => Promise<void>>(async () => {});
+
   useEffect(() => {
-    pendingChunks.current.clear();
-    emptyChunks.current.clear();
-    setChunkTiles(new Map());
-  }, [config.dimension, config.heightRange.min, config.heightRange.max]);
+    loadVisibleTilesRef.current = async () => {
+      const container = containerRef.current;
+      if (!container) return;
 
-  // Subscribe to WebSocket chunk updates to invalidate specific cached chunks
+      const { offsetX, offsetY, zoom } = viewStateRef.current;
+      const width  = container.clientWidth;
+      const height = container.clientHeight;
+      if (width === 0 || height === 0) return;
+
+      const { dimension, heightRange } = configRef.current;
+      const generation = loadGeneration.current;
+
+      // ── compute visible tile range ────────────────────────────────────────
+      const tilePixelW = TILE_PIXEL_SIZE * zoom;
+      const startTileX = Math.floor((-offsetX - width  / 2) / tilePixelW) - 1;
+      const endTileX   = Math.ceil( (-offsetX + width  / 2) / tilePixelW) + 1;
+      const startTileZ = Math.floor((-offsetY - height / 2) / tilePixelW) - 1;
+      const endTileZ   = Math.ceil( (-offsetY + height / 2) / tilePixelW) + 1;
+
+      const dimMap = tileCacheByDim.current.get(dimension) ?? new Map<string, HTMLCanvasElement>();
+      tileCacheByDim.current.set(dimension, dimMap);
+
+      // ── cull tiles that have scrolled off-screen ──────────────────────────
+      for (const [key, canvas] of visibleCanvases.current) {
+        const [tx, tz] = key.split(',').map(Number);
+        if (tx < startTileX || tx > endTileX || tz < startTileZ || tz > endTileZ) {
+          canvas.remove();
+          visibleCanvases.current.delete(key);
+        }
+      }
+
+      // ── show cached tiles that scrolled into view ─────────────────────────
+      for (const [key, canvas] of dimMap) {
+        const [tx, tz] = key.split(',').map(Number);
+        if (tx >= startTileX && tx <= endTileX && tz >= startTileZ && tz <= endTileZ) {
+          if (!canvas.parentElement) {
+            attachTile(key, canvas);
+          }
+        }
+      }
+
+      // ── determine which tiles still need rendering ─────────────────────────
+      const centerTileX = -offsetX / tilePixelW;
+      const centerTileZ = -offsetY / tilePixelW;
+      const tilesToLoad: { tileX: number; tileZ: number }[] = [];
+
+      for (let tx = startTileX; tx <= endTileX; tx++) {
+        for (let tz = startTileZ; tz <= endTileZ; tz++) {
+          const key = tileKey(tx, tz);
+          if (dimMap.has(key)) continue;
+          if (pendingTileKeys.current.has(key)) continue;
+          if (emptyTileKeys.current.has(emptyKey(dimension, tx, tz))) continue;
+          tilesToLoad.push({ tileX: tx, tileZ: tz });
+        }
+      }
+
+      if (tilesToLoad.length === 0) return;
+
+      // Sort center-first
+      tilesToLoad.sort((a, b) => {
+        const dA = (a.tileX - centerTileX) ** 2 + (a.tileZ - centerTileZ) ** 2;
+        const dB = (b.tileX - centerTileX) ** 2 + (b.tileZ - centerTileZ) ** 2;
+        return dA - dB;
+      });
+
+      // ── offline mode ──────────────────────────────────────────────────────
+      if (modeRef.current === 'offline' && offlineReaderRef.current) {
+        for (let i = 0; i < tilesToLoad.length; i++) {
+          if (loadGeneration.current !== generation) break;
+
+          const { tileX, tileZ } = tilesToLoad[i];
+          const key = tileKey(tileX, tileZ);
+          pendingTileKeys.current.add(key);
+
+          if (workersAvailable.current) {
+            // ── worker path: check IndexedDB first ────────────────────────
+            const chunks = collectTileChunks(tileX, tileZ, dimension);
+            if (!chunks) {
+              pendingTileKeys.current.delete(key);
+              emptyTileKeys.current.add(emptyKey(dimension, tileX, tileZ));
+              continue;
+            }
+
+            // Compute hash of raw subchunk data to compare with cached hash
+            const hashBufs = chunks.flatMap(c => c.subchunks.map(sc => new Uint8Array(sc.data)));
+            const currentHash = fnv1a(hashBufs);
+
+            const cached = await tileCache.get(dimension, heightRange.min, heightRange.max, tileX, tileZ);
+            if (loadGeneration.current !== generation) break;
+
+            if (cached && cached.hash === currentHash) {
+              // IndexedDB cache hit
+              pendingTileKeys.current.delete(key);
+              const canvas = createTileCanvas(tileX, tileZ, cached.pixels);
+              dimMap.set(key, canvas);
+              attachTile(key, canvas);
+              continue;
+            }
+
+            // Dispatch to worker
+            const jobId = `${generation}:${dimension}:${heightRange.min}:${heightRange.max}:${tileX}:${tileZ}`;
+            const request: TileRenderRequest = {
+              id: jobId,
+              tileX,
+              tileZ,
+              tileSize: TILE_SIZE,
+              dimension,
+              heightRange: { min: heightRange.min, max: heightRange.max },
+              chunks,
+            };
+            const job: TileJob = { key, generation, request, dimension, heightMin: heightRange.min, heightMax: heightRange.max };
+
+            const idleWorker = workerPool.current.find(w => !w.busy);
+            if (idleWorker) {
+              idleWorker.busy = true;
+              idleWorker.worker.postMessage(request);
+            } else {
+              jobQueue.current.push(job);
+            }
+
+          } else {
+            // ── fallback: main-thread rendering ───────────────────────────
+            const canvas = renderTileFallback(tileX, tileZ, dimension, heightRange);
+            pendingTileKeys.current.delete(key);
+
+            if (!canvas) {
+              emptyTileKeys.current.add(emptyKey(dimension, tileX, tileZ));
+            } else {
+              dimMap.set(key, canvas);
+              if (loadGeneration.current === generation) {
+                attachTile(key, canvas);
+              }
+            }
+
+            // Yield to the event loop between fallback batches
+            if ((i + 1) % FALLBACK_BATCH_SIZE === 0 && i + 1 < tilesToLoad.length) {
+              await yieldToMain();
+            }
+          }
+        }
+      }
+
+      // ── backend mode ──────────────────────────────────────────────────────
+      if (modeRef.current === 'backend' && backendServiceRef.current) {
+        const batchSize = 32;
+        // Collect all chunk coords for unrendered tiles
+        const allCoords: ChunkCoord[] = [];
+        const coordToTile = new Map<string, { tileX: number; tileZ: number }>();
+
+        for (const { tileX, tileZ } of tilesToLoad) {
+          const key = tileKey(tileX, tileZ);
+          pendingTileKeys.current.add(key);
+          const baseCX = tileX * TILE_SIZE;
+          const baseCZ = tileZ * TILE_SIZE;
+          for (let lx = 0; lx < TILE_SIZE; lx++) {
+            for (let lz = 0; lz < TILE_SIZE; lz++) {
+              const cx = baseCX + lx;
+              const cz = baseCZ + lz;
+              allCoords.push({ x: cx, z: cz });
+              coordToTile.set(`${cx},${cz}`, { tileX, tileZ });
+            }
+          }
+        }
+
+        // Process in batches
+        for (let i = 0; i < allCoords.length; i += batchSize) {
+          if (loadGeneration.current !== generation) break;
+
+          const batch = allCoords.slice(i, i + batchSize);
+          try {
+            const chunkDataList: ChunkRenderData[] = await backendServiceRef.current.getChunks(
+              batch,
+              dimension,
+              heightRange,
+            );
+            if (loadGeneration.current !== generation) break;
+
+            // Accumulate chunks per tile
+            const tilePxMap = new Map<string, Uint8ClampedArray<ArrayBuffer>>();
+            const tileHasData = new Set<string>();
+
+            for (const chunkData of chunkDataList) {
+              const tileInfo = coordToTile.get(`${chunkData.x},${chunkData.z}`);
+              if (!tileInfo) continue;
+              const { tileX, tileZ } = tileInfo;
+              const key = tileKey(tileX, tileZ);
+              if (!tilePxMap.has(key)) {
+                tilePxMap.set(key, new Uint8ClampedArray(TILE_PIXEL_SIZE * TILE_PIXEL_SIZE * 4));
+              }
+              const px = tilePxMap.get(key)!;
+              const lx = chunkData.x - tileX * TILE_SIZE;
+              const lz = chunkData.z - tileZ * TILE_SIZE;
+              const srcPx = new Uint8ClampedArray(chunkData.pixels);
+              const dstBaseX = lx * CHUNK_SIZE;
+              const dstBaseZ = lz * CHUNK_SIZE;
+              for (let bx = 0; bx < CHUNK_SIZE; bx++) {
+                for (let bz = 0; bz < CHUNK_SIZE; bz++) {
+                  const srcIdx = (bz * CHUNK_SIZE + bx) * 4;
+                  const dstIdx = ((dstBaseZ + bz) * TILE_PIXEL_SIZE + (dstBaseX + bx)) * 4;
+                  px[dstIdx]     = srcPx[srcIdx];
+                  px[dstIdx + 1] = srcPx[srcIdx + 1];
+                  px[dstIdx + 2] = srcPx[srcIdx + 2];
+                  px[dstIdx + 3] = srcPx[srcIdx + 3];
+                }
+              }
+              tileHasData.add(key);
+            }
+
+            // Commit completed tile canvases
+            for (const { tileX, tileZ } of tilesToLoad) {
+              const key = tileKey(tileX, tileZ);
+              if (!dimMap.has(key) && tileHasData.has(key)) {
+                const pixels = tilePxMap.get(key)!;
+                const canvas = createTileCanvas(tileX, tileZ, pixels);
+                dimMap.set(key, canvas);
+                pendingTileKeys.current.delete(key);
+                if (loadGeneration.current === generation) {
+                  attachTile(key, canvas);
+                }
+              }
+            }
+          } catch (err) {
+            console.error('Failed to load backend chunks:', err);
+            for (const { tileX, tileZ } of tilesToLoad) {
+              pendingTileKeys.current.delete(tileKey(tileX, tileZ));
+            }
+          }
+        }
+
+        // Mark tiles with no data as empty
+        for (const { tileX, tileZ } of tilesToLoad) {
+          const key = tileKey(tileX, tileZ);
+          if (!dimMap.has(key)) {
+            pendingTileKeys.current.delete(key);
+            emptyTileKeys.current.add(emptyKey(dimension, tileX, tileZ));
+          }
+        }
+      }
+    };
+  }); // No deps — updated every render so refs are always current
+
+  // ─── effects ─────────────────────────────────────────────────────────────────
+
+  // Trigger tile loading after view or config changes (debounced)
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      loadVisibleTilesRef.current();
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [viewState, config, mode]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Clear caches when height range changes (height affects rendered pixels)
+  useEffect(() => {
+    loadGeneration.current++;
+    jobQueue.current = [];
+    pendingTileKeys.current = new Set();
+    emptyTileKeys.current = new Set();
+
+    // Remove all tile canvases from DOM and clear all dimension caches
+    for (const dimMap of tileCacheByDim.current.values()) {
+      for (const canvas of dimMap.values()) canvas.remove();
+      dimMap.clear();
+    }
+    visibleCanvases.current.clear();
+  }, [config.heightRange.min, config.heightRange.max]);
+
+  // Clear DOM (not dimension cache) when dimension changes
+  useEffect(() => {
+    loadGeneration.current++;
+    jobQueue.current = [];
+    pendingTileKeys.current = new Set();
+
+    clearDom();
+    // loadVisibleTiles (triggered by viewState/config effect above) will
+    // re-show any cached tiles for the new dimension and queue missing ones.
+  }, [config.dimension, clearDom]);
+
+  // Subscribe to backend WebSocket chunk updates
   useEffect(() => {
     if (mode !== 'backend' || !backendService) return;
 
     const unsubscribe = backendService.onChunkUpdate((updatedCoords) => {
       for (const coord of updatedCoords) {
-        const prefix = `${coord.x},${coord.z},`;
-        for (const key of emptyChunks.current) {
-          if (key.startsWith(prefix)) {
-            emptyChunks.current.delete(key);
+        const tileX = Math.floor(coord.x / TILE_SIZE);
+        const tileZ = Math.floor(coord.z / TILE_SIZE);
+        const key   = tileKey(tileX, tileZ);
+
+        // Invalidate this tile in all dimension caches
+        for (const [dim, dimMap] of tileCacheByDim.current) {
+          if (dimMap.has(key)) {
+            const canvas = dimMap.get(key)!;
+            canvas.remove();
+            dimMap.delete(key);
+            visibleCanvases.current.delete(key);
+            // Also remove from IndexedDB (we don't know height ranges to clear exactly,
+            // but a new render will overwrite on next load)
+            tileCache.delete(dim, config.heightRange.min, config.heightRange.max, tileX, tileZ);
           }
         }
-        setChunkTiles(prev => {
-          const updated = new Map(prev);
-          for (const key of updated.keys()) {
-            if (key.startsWith(prefix)) {
-              updated.delete(key);
-            }
-          }
-          return updated;
-        });
+
+        // Remove from empty-tile tracking so it gets re-checked
+        emptyTileKeys.current.delete(emptyKey(config.dimension, tileX, tileZ));
       }
     });
 
     return unsubscribe;
-  }, [mode, backendService]);
+  }, [mode, backendService, config.heightRange.min, config.heightRange.max, config.dimension]);
 
-  // Load chunks when view changes
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      loadVisibleChunks();
-    }, 100);
-    return () => clearTimeout(timer);
-  }, [viewState, config, mode]); // eslint-disable-line react-hooks/exhaustive-deps
+  // ─── input handlers ──────────────────────────────────────────────────────────
 
-  // Mouse/touch handlers
   const handlePointerDown = useCallback((e: React.PointerEvent) => {
     if (pinchActive.current) return;
     isDragging.current = true;
@@ -291,6 +684,20 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   }, []);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
+    // Update cursor world position
+    if (onCursorPosition) {
+      const container = containerRef.current;
+      if (container) {
+        const rect = container.getBoundingClientRect();
+        const { offsetX, offsetY, zoom } = viewStateRef.current;
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const worldX = Math.round((mx - container.clientWidth  / 2 - offsetX) / zoom);
+        const worldZ = Math.round((my - container.clientHeight / 2 - offsetY) / zoom);
+        onCursorPosition({ x: worldX, z: worldZ });
+      }
+    }
+
     if (!isDragging.current || pinchActive.current) return;
     const dx = e.clientX - lastPointer.current.x;
     const dy = e.clientY - lastPointer.current.y;
@@ -300,11 +707,16 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       offsetX: prev.offsetX + dx,
       offsetY: prev.offsetY + dy,
     }));
-  }, []);
+  }, [onCursorPosition]);
 
   const handlePointerUp = useCallback(() => {
     isDragging.current = false;
   }, []);
+
+  const handlePointerLeave = useCallback(() => {
+    isDragging.current = false;
+    if (onCursorPosition) onCursorPosition(null);
+  }, [onCursorPosition]);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
@@ -315,11 +727,9 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     setViewState(prev => {
       const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, prev.zoom * (1 + delta)));
       const zoomRatio = newZoom / prev.zoom;
-
       const rect = container.getBoundingClientRect();
-      const mx = e.clientX - rect.left - container.clientWidth / 2;
-      const my = e.clientY - rect.top - container.clientHeight / 2;
-
+      const mx = e.clientX - rect.left - container.clientWidth  / 2;
+      const my = e.clientY - rect.top  - container.clientHeight / 2;
       return {
         zoom: newZoom,
         offsetX: mx - (mx - prev.offsetX) * zoomRatio,
@@ -328,9 +738,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     });
   }, []);
 
-  // Touch gesture handling (pinch zoom)
   const handleTouchStart = useCallback((e: React.TouchEvent) => {
-    activeTouches.current = e.touches.length;
     if (e.touches.length === 2) {
       pinchActive.current = true;
       isDragging.current = false;
@@ -351,13 +759,11 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
 
       const container = containerRef.current;
       if (!container) return;
-
-      // Zoom centered on pinch midpoint
       const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
       const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
       const rect = container.getBoundingClientRect();
-      const mx = midX - rect.left - container.clientWidth / 2;
-      const my = midY - rect.top - container.clientHeight / 2;
+      const mx = midX - rect.left - container.clientWidth  / 2;
+      const my = midY - rect.top  - container.clientHeight / 2;
 
       setViewState(prev => {
         const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, prev.zoom * scale));
@@ -372,92 +778,17 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   }, []);
 
   const handleTouchEnd = useCallback((e: React.TouchEvent) => {
-    activeTouches.current = e.touches.length;
     if (e.touches.length < 2) {
       pinchDistance.current = null;
-      // Delay clearing pinch state to prevent stale pointer events from causing jitter
-      setTimeout(() => {
-        pinchActive.current = false;
-      }, 100);
+      setTimeout(() => { pinchActive.current = false; }, 100);
     }
   }, []);
 
+  // ─── render ──────────────────────────────────────────────────────────────────
+
   const { offsetX, offsetY, zoom } = viewState;
-
-  // Compute which tiles are currently visible in the viewport for culling.
-  // Non-visible tiles are kept in memory (chunkTiles) but not rendered in the DOM.
-  const visibleTiles = useMemo(() => {
-    const container = containerRef.current;
-    const width = container?.clientWidth || 0;
-    const height = container?.clientHeight || 0;
-    if (width === 0 || height === 0) return Array.from(chunkTiles.values());
-
-    const pixelSize = CHUNK_SIZE * zoom;
-    const startChunkX = Math.floor((-offsetX - width / 2) / pixelSize) - 1;
-    const endChunkX = Math.ceil((-offsetX + width / 2) / pixelSize) + 1;
-    const startChunkZ = Math.floor((-offsetY - height / 2) / pixelSize) - 1;
-    const endChunkZ = Math.ceil((-offsetY + height / 2) / pixelSize) + 1;
-
-    const result: ChunkTileData[] = [];
-    for (const tile of chunkTiles.values()) {
-      if (tile.x >= startChunkX && tile.x <= endChunkX &&
-          tile.z >= startChunkZ && tile.z <= endChunkZ) {
-        result.push(tile);
-      }
-    }
-    return result;
-  }, [chunkTiles, offsetX, offsetY, zoom]);
-
-  // Sync the canvas cache with the chunkTiles state.
-  // Creates a canvas and draws pixels once when a new tile is added;
-  // destroys the canvas (removing from DOM too) when a tile is removed.
-  useEffect(() => {
-    // Remove canvases for tiles that are no longer in state
-    for (const [key, canvas] of Array.from(canvasCache.current.entries())) {
-      if (!chunkTiles.has(key)) {
-        canvas.remove();
-        canvasCache.current.delete(key);
-      }
-    }
-    // Create and draw canvases for new tiles (not yet in the cache)
-    for (const [key, tile] of chunkTiles) {
-      if (!canvasCache.current.has(key)) {
-        const canvas = document.createElement('canvas');
-        canvas.width = 16;
-        canvas.height = 16;
-        canvas.className = 'map-chunk-tile';
-        canvas.style.left = `${tile.x * CHUNK_SIZE}px`;
-        canvas.style.top = `${tile.z * CHUNK_SIZE}px`;
-        canvas.style.width = `${CHUNK_SIZE}px`;
-        canvas.style.height = `${CHUNK_SIZE}px`;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.putImageData(new ImageData(tile.pixels, 16, 16), 0, 0);
-        }
-        canvasCache.current.set(key, canvas);
-      }
-    }
-  }, [chunkTiles]);
-
-  // Sync DOM presence of chunk canvases based on which tiles are visible.
-  // Visible canvases are appended to the chunk layer div; non-visible ones
-  // are detached from the DOM but kept alive in canvasCache for fast re-attachment.
-  useEffect(() => {
-    const layer = chunkLayerRef.current;
-    if (!layer) return;
-
-    const visibleKeys = new Set(visibleTiles.map(t => t.key));
-
-    for (const [key, canvas] of canvasCache.current) {
-      if (visibleKeys.has(key)) {
-        if (!canvas.parentElement) {
-          layer.appendChild(canvas);
-        }
-      } else if (canvas.parentElement) {
-        canvas.remove();
-      }
-    }
-  }, [visibleTiles]);
+  const containerWidth  = containerRef.current?.clientWidth  ?? 0;
+  const containerHeight = containerRef.current?.clientHeight ?? 0;
 
   return (
     <div
@@ -467,34 +798,55 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
       onPointerCancel={handlePointerUp}
+      onPointerLeave={handlePointerLeave}
       onWheel={handleWheel}
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
     >
-      {/* Chunk layer — canvases are managed imperatively via chunkLayerRef */}
+      {/* Tile canvases are managed imperatively via chunkLayerRef */}
       <div
         ref={chunkLayerRef}
         className="map-chunk-layer"
         style={{
-          transform: `translate(${offsetX + (containerRef.current?.clientWidth || 0) / 2}px, ${offsetY + (containerRef.current?.clientHeight || 0) / 2}px) scale(${zoom})`,
+          transform: `translate(${offsetX + containerWidth / 2}px, ${offsetY + containerHeight / 2}px) scale(${zoom})`,
           transformOrigin: '0 0',
         }}
+      />
+
+      {/* Marker overlay — sits above the tile layer, NOT scaled with zoom */}
+      <div
+        className="map-marker-overlay"
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+          width: '100%',
+          height: '100%',
+          pointerEvents: 'none',
+          overflow: 'hidden',
+        }}
       >
-        {/* Markers */}
-        {markers.map(marker => (
-          <div
-            key={marker.id}
-            className="map-marker"
-            style={{
-              left: marker.x,
-              top: marker.z,
-            }}
-          >
-            <div className={`marker-dot ${marker.type}`} />
-            <div className="marker-label">{marker.label}</div>
-          </div>
-        ))}
+        {markers.map(marker => {
+          const screenX = marker.x * zoom + offsetX + containerWidth  / 2;
+          const screenZ = marker.z * zoom + offsetY + containerHeight / 2;
+          return (
+            <div
+              key={marker.id}
+              className="map-marker"
+              style={{
+                position: 'absolute',
+                left: screenX,
+                top:  screenZ,
+                width: 0,
+                height: 0,
+              }}
+            >
+              <div className={`marker-dot ${marker.type}`} />
+              <div className="marker-label">{marker.label}</div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

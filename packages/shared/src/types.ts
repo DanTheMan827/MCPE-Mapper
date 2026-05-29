@@ -34,7 +34,7 @@ export interface MapMarker {
   y: number;
   z: number;
   dimension: number;
-  type: 'player' | 'nether_portal' | 'end_portal';
+  type: 'player' | 'nether_portal' | 'end_portal' | 'banner';
   label: string;
 }
 
