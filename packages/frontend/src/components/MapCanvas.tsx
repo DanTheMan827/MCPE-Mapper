@@ -13,7 +13,7 @@ const TILE_SIZE = 4;
 const CHUNK_SIZE = 16;
 /** Pixel dimensions of one rendered tile canvas */
 const TILE_PIXEL_SIZE = TILE_SIZE * CHUNK_SIZE;
-const MAX_WORKERS = 4;
+const MAX_WORKERS = 16;
 const MIN_ZOOM = 0.25;
 const MAX_ZOOM = 32;
 const DEFAULT_ZOOM = 2;
