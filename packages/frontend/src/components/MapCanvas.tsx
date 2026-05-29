@@ -697,7 +697,20 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     isDragging.current = true;
     lastPointer.current = { x: e.clientX, y: e.clientY };
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
-  }, []);
+
+    if (onCursorPosition) {
+      const container = containerRef.current;
+      if (container) {
+        const rect = container.getBoundingClientRect();
+        const { offsetX, offsetY, zoom } = viewStateRef.current;
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const worldX = Math.round((mx - container.clientWidth  / 2 - offsetX) / zoom);
+        const worldZ = Math.round((my - container.clientHeight / 2 - offsetY) / zoom);
+        onCursorPosition({ x: worldX, z: worldZ });
+      }
+    }
+  }, [onCursorPosition]);
 
   const handlePointerMove = useCallback((e: React.PointerEvent) => {
     // Update cursor world position
@@ -731,8 +744,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
 
   const handlePointerLeave = useCallback(() => {
     isDragging.current = false;
-    if (onCursorPosition) onCursorPosition(null);
-  }, [onCursorPosition]);
+  }, []);
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     e.preventDefault();
