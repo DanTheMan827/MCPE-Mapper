@@ -20,6 +20,8 @@ const App: React.FC = () => {
   const [backendService, setBackendService] = useState<BackendService | null>(null);
   const [features, setFeatures] = useState({ portals: true, players: true });
   const [backendAvailable, setBackendAvailable] = useState<boolean | null>(null);
+  const [cursorPosition, setCursorPosition] = useState<{ x: number; z: number } | null>(null);
+  const [navigateTo, setNavigateTo] = useState<{ x: number; z: number; dimension: number; ts: number } | null>(null);
 
   const [config, setConfig] = useState<ViewerConfig>({
     showNetherPortals: true,
@@ -137,6 +139,13 @@ const App: React.FC = () => {
     setConfig(prev => ({ ...prev, ...newConfig }));
   }, []);
 
+  const handlePlayerNavigate = useCallback((marker: MapMarker) => {
+    // Switch dimension if needed, then navigate to the player's position
+    setConfig(prev => ({ ...prev, dimension: marker.dimension }));
+    // Use timestamp to ensure navigation always triggers even for same coordinates
+    setNavigateTo({ x: marker.x, z: marker.z, dimension: marker.dimension, ts: Date.now() });
+  }, []);
+
   const filteredMarkers = markers.filter(m => {
     if (m.dimension !== config.dimension) return false;
     if (m.type === 'nether_portal' && !config.showNetherPortals) return false;
@@ -144,6 +153,8 @@ const App: React.FC = () => {
     if (m.type === 'player' && !config.showPlayers) return false;
     return true;
   });
+
+  const playerMarkers = markers.filter(m => m.type === 'player');
 
   return (
     <div className="app-container">
@@ -167,14 +178,18 @@ const App: React.FC = () => {
             offlineReader={offlineReader}
             backendService={backendService}
             markers={filteredMarkers}
+            onCursorPosition={setCursorPosition}
+            navigateTo={navigateTo}
           />
           <ControlsPanel
             config={config}
             features={features}
             worldInfo={worldInfo}
             onChange={handleConfigChange}
+            playerMarkers={playerMarkers}
+            onPlayerNavigate={handlePlayerNavigate}
           />
-          <InfoPanel worldInfo={worldInfo} config={config} />
+          <InfoPanel worldInfo={worldInfo} config={config} cursorPosition={cursorPosition} />
         </>
       )}
 

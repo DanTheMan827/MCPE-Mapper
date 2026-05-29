@@ -17,6 +17,7 @@ export class OfflineWorldReader {
   private dbParsed = false;
   /** Index mapping "chunkX,chunkZ,dimension" to set of subchunk key hex strings */
   private chunkIndex: Map<string, Set<string>> = new Map();
+  private readonly textDecoder = new TextDecoder('utf-8', { fatal: false });
 
   async loadFile(file: File): Promise<WorldInfo> {
     this.zip = await JSZip.loadAsync(file);
@@ -1017,6 +1018,18 @@ export class OfflineWorldReader {
     // Look for portal blocks and banners in block entity data
     for (const [keyHex, value] of this.parsedKeys) {
       const key = this.hexToBytes(keyHex);
+
+      // Check for 'portals' key containing PortalRecords
+      try {
+        const keyStr = new TextDecoder().decode(key);
+        if (keyStr === 'portals') {
+          this.extractPortalRecords(value, markers);
+          continue;
+        }
+      } catch {
+        // Not a text key
+      }
+
       if (key.length < 9) continue;
 
       // Check block entity data (tag 49 = BlockEntity)
@@ -1041,6 +1054,11 @@ export class OfflineWorldReader {
         this.extractPortalMarkers(value, kx, kz, dim, markers);
         this.extractBannerMarkers(value, kx, kz, dim, markers);
       }
+
+      // Tag 47 (0x2f) = SubChunkPrefix - scan palette for portal blocks
+      if (tag === 0x2f) {
+        this.extractPortalFromSubchunk(value, kx, kz, dim, markers);
+      }
     }
 
     return markers;
@@ -1051,53 +1069,32 @@ export class OfflineWorldReader {
       if (data.length < 3 || data[0] !== 10) return null;
       const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
 
-      let offset = 1;
-      const rootNameLen = view.getInt16(offset, true);
-      offset += 2 + rootNameLen;
+      // Use full NBT parser to avoid picking up nested Name tags from inventory items
+      const result = this.readNBTCompound(view, 0, data);
+      if (!result) return null;
 
-      let x = 0, y = 0, z = 0, dimension = 0;
-      let foundPos = false;
+      const compound = result.value;
+      const pos = compound['Pos'] as number[] | undefined;
+      if (!pos || pos.length < 3) return null;
+
+      const x = pos[0];
+      const y = pos[1];
+      const z = pos[2];
+      const dimension = (compound['DimensionId'] as number) ?? 0;
+
+      // Try NameTag first (most reliable for player display name), then fall back
       let name: string | undefined;
-
-      while (offset < data.length) {
-        const tagType = data[offset]; offset++;
-        if (tagType === 0) break;
-
-        const nameLen = view.getInt16(offset, true); offset += 2;
-        const tagName = new TextDecoder().decode(data.slice(offset, offset + nameLen));
-        offset += nameLen;
-
-        if (tagType === 9 && tagName === 'Pos') {
-          // List of floats
-          const listType = data[offset]; offset++;
-          const listLen = view.getInt32(offset, true); offset += 4;
-          if (listType === 5 && listLen === 3) {
-            x = view.getFloat32(offset, true); offset += 4;
-            y = view.getFloat32(offset, true); offset += 4;
-            z = view.getFloat32(offset, true); offset += 4;
-            foundPos = true;
-          } else {
-            for (let i = 0; i < listLen; i++) {
-              const skip = this.skipNBTPayload(listType, data, offset);
-              if (skip < 0) return null;
-              offset += skip;
-            }
-          }
-        } else if (tagType === 3 && tagName === 'DimensionId') {
-          dimension = view.getInt32(offset, true); offset += 4;
-        } else if (tagType === 8 && (tagName === 'Username' || tagName === 'Name')) {
-          const strLen = view.getInt16(offset, true); offset += 2;
-          const candidate = new TextDecoder().decode(data.slice(offset, offset + strLen));
-          offset += strLen;
-          if (!name) name = candidate;
-        } else {
-          const skip = this.skipNBTPayload(tagType, data, offset);
-          if (skip < 0) return null;
-          offset += skip;
+      const nameTag = compound['NameTag'] as string | undefined;
+      if (nameTag && nameTag.length > 0) {
+        name = nameTag;
+      } else {
+        const username = compound['Username'] as string | undefined;
+        if (username && username.length > 0) {
+          name = username;
         }
       }
 
-      if (foundPos) return { x, y, z, dimension, name };
+      return { x, y, z, dimension, name };
     } catch {
       // Parse error
     }
@@ -1106,7 +1103,7 @@ export class OfflineWorldReader {
 
   private extractPortalMarkers(data: Uint8Array, chunkX: number, chunkZ: number, dimension: number, markers: MapMarker[]): void {
     // Look for nether portal or end portal blocks in block entity data
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(data);
+    const text = this.textDecoder.decode(data);
 
     if (text.includes('NetherPortal') || text.includes('nether_portal')) {
       markers.push({
@@ -1132,9 +1129,93 @@ export class OfflineWorldReader {
       });
     }
   }
+
+  private extractPortalFromSubchunk(data: Uint8Array, chunkX: number, chunkZ: number, dimension: number, markers: MapMarker[]): void {
+    // Quick text scan of subchunk palette for portal block names
+    // Bedrock nether portals use 'minecraft:portal', end portals use 'minecraft:end_portal'
+    const text = this.textDecoder.decode(data);
+
+    const hasEndPortal = text.includes('minecraft:end_portal');
+    // Check for nether portal: 'minecraft:portal' but not as part of 'minecraft:end_portal'
+    const hasNetherPortal = text.includes('minecraft:portal') && (
+      text.includes('minecraft:nether_portal') ||
+      // Ensure 'minecraft:portal' is not just from 'minecraft:end_portal'
+      text.replace(/minecraft:end_portal/g, '').includes('minecraft:portal')
+    );
+
+    if (hasNetherPortal) {
+      const portalId = `nether_portal_${chunkX}_${chunkZ}_${dimension}`;
+      if (!markers.some(m => m.id === portalId)) {
+        markers.push({
+          id: portalId,
+          x: chunkX * 16 + 8,
+          y: 64,
+          z: chunkZ * 16 + 8,
+          dimension,
+          type: 'nether_portal',
+          label: 'Nether Portal',
+        });
+      }
+    }
+
+    if (hasEndPortal) {
+      const endId = `end_portal_${chunkX}_${chunkZ}_${dimension}`;
+      if (!markers.some(m => m.id === endId)) {
+        markers.push({
+          id: endId,
+          x: chunkX * 16 + 8,
+          y: 64,
+          z: chunkZ * 16 + 8,
+          dimension,
+          type: 'end_portal',
+          label: 'End Portal',
+        });
+      }
+    }
+  }
+
+  private extractPortalRecords(data: Uint8Array, markers: MapMarker[]): void {
+    // The 'portals' key contains NBT: { data: { PortalRecords: [ { DimId, TpX, TpY, TpZ, Span, Xa, Za }, ... ] } }
+    try {
+      if (data.length < 3 || data[0] !== 10) return;
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const result = this.readNBTCompound(view, 0, data);
+      if (!result) return;
+
+      const dataTag = result.value['data'] as Record<string, unknown> | undefined;
+      if (!dataTag) return;
+
+      const records = dataTag['PortalRecords'] as Array<Record<string, unknown>> | undefined;
+      if (!records || !Array.isArray(records)) return;
+
+      for (let i = 0; i < records.length; i++) {
+        const record = records[i];
+        const dimId = (record['DimId'] as number) ?? 0;
+        const tpX = (record['TpX'] as number) ?? 0;
+        const tpY = (record['TpY'] as number) ?? 0;
+        const tpZ = (record['TpZ'] as number) ?? 0;
+
+        const portalId = `portal_record_${i}_${tpX}_${tpY}_${tpZ}_${dimId}`;
+        if (!markers.some(m => m.id === portalId)) {
+          markers.push({
+            id: portalId,
+            x: tpX,
+            y: tpY,
+            z: tpZ,
+            dimension: dimId,
+            type: 'nether_portal',
+            label: 'Nether Portal',
+          });
+        }
+      }
+    } catch {
+      // Parse error - skip
+    }
+  }
+
   private extractBannerMarkers(data: Uint8Array, chunkX: number, chunkZ: number, dimension: number, markers: MapMarker[]): void {
     // Banners have id == "Banner" in their block entity NBT
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(data);
+    const text = this.textDecoder.decode(data);
     if (!text.includes('Banner')) return;
 
     try {

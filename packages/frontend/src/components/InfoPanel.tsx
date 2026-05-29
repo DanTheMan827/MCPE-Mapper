@@ -4,6 +4,7 @@ import { WorldInfo, ViewerConfig } from '@mcpe-mapper/shared';
 interface InfoPanelProps {
   worldInfo: WorldInfo | null;
   config: ViewerConfig;
+  cursorPosition?: { x: number; z: number } | null;
 }
 
 const DIMENSION_NAMES: Record<number, string> = {
@@ -12,7 +13,7 @@ const DIMENSION_NAMES: Record<number, string> = {
   2: 'The End',
 };
 
-export const InfoPanel: React.FC<InfoPanelProps> = ({ worldInfo, config }) => {
+export const InfoPanel: React.FC<InfoPanelProps> = ({ worldInfo, config, cursorPosition }) => {
   if (!worldInfo) return null;
 
   return (
@@ -23,9 +24,11 @@ export const InfoPanel: React.FC<InfoPanelProps> = ({ worldInfo, config }) => {
       <div>
         Spawn: <span className="coord">{worldInfo.spawnX}, {worldInfo.spawnY}, {worldInfo.spawnZ}</span>
       </div>
-      <div>
-        Height: <span className="coord">{config.heightRange.min} → {config.heightRange.max}</span>
-      </div>
+      {cursorPosition && (
+        <div>
+          Cursor: <span className="coord">{cursorPosition.x}, {cursorPosition.z}</span>
+        </div>
+      )}
     </div>
   );
 };

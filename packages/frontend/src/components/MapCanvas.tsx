@@ -29,6 +29,7 @@ interface MapCanvasProps {
   backendService: BackendService | null;
   markers: MapMarker[];
   onCursorPosition?: (pos: { x: number; z: number } | null) => void;
+  navigateTo?: { x: number; z: number; dimension: number; ts: number } | null;
 }
 
 interface WorkerEntry {
@@ -86,6 +87,7 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
   backendService,
   markers,
   onCursorPosition,
+  navigateTo,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const chunkLayerRef = useRef<HTMLDivElement>(null);
@@ -199,8 +201,11 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
 
   /** Remove all tile canvases from DOM but keep them in the dimension cache */
   const clearDom = useCallback(() => {
-    for (const canvas of visibleCanvases.current.values()) {
-      canvas.remove();
+    const layer = chunkLayerRef.current;
+    if (layer) {
+      while (layer.firstChild) {
+        layer.removeChild(layer.firstChild);
+      }
     }
     visibleCanvases.current.clear();
   }, []);
@@ -642,6 +647,17 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
     // loadVisibleTiles (triggered by viewState/config effect above) will
     // re-show any cached tiles for the new dimension and queue missing ones.
   }, [config.dimension, clearDom]);
+
+  // Navigate to a specific world position when navigateTo changes
+  useEffect(() => {
+    if (!navigateTo) return;
+    const { zoom } = viewStateRef.current;
+    setViewState({
+      offsetX: -navigateTo.x * zoom,
+      offsetY: -navigateTo.z * zoom,
+      zoom,
+    });
+  }, [navigateTo]);
 
   // Subscribe to backend WebSocket chunk updates
   useEffect(() => {
