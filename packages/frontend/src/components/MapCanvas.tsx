@@ -23,7 +23,7 @@ interface ChunkTileData {
   key: string;
   x: number;
   z: number;
-  pixels: Uint8ClampedArray;
+  pixels: ImageDataArray;
 }
 
 /** Yield control back to the event loop */
