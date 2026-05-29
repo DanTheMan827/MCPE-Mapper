@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render } from '@testing-library/react';
+import { render, fireEvent } from '@testing-library/react';
 import { MapCanvas } from '../components/MapCanvas';
 import { ViewerConfig } from '@mcpe-mapper/shared';
 
@@ -9,6 +9,7 @@ beforeEach(() => {
     putImageData: vi.fn(),
   } as any);
   vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,mock');
+  HTMLElement.prototype.setPointerCapture = vi.fn();
 });
 
 const mockConfig: ViewerConfig = {
@@ -115,5 +116,51 @@ describe('MapCanvas', () => {
     );
     const dot = container.querySelector('.marker-dot');
     expect(dot).toHaveClass('nether_portal');
+  });
+
+  it('updates and keeps cursor position when tapping and leaving the map', () => {
+    const onCursorPosition = vi.fn();
+    const { container } = render(
+      <MapCanvas
+        mode="offline"
+        config={mockConfig}
+        offlineReader={null}
+        backendService={null}
+        markers={[]}
+        onCursorPosition={onCursorPosition}
+      />
+    );
+
+    const mapDiv = container.querySelector('.map-canvas') as HTMLElement;
+    fireEvent.pointerDown(mapDiv, { clientX: 40, clientY: 60, pointerId: 1 });
+    fireEvent.pointerLeave(mapDiv);
+
+    expect(onCursorPosition).toHaveBeenCalledTimes(1);
+    expect(onCursorPosition.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ x: expect.any(Number), z: expect.any(Number) })
+    );
+    expect(onCursorPosition).not.toHaveBeenCalledWith(null);
+  });
+
+  it('updates cursor position on mouse move', () => {
+    const onCursorPosition = vi.fn();
+    const { container } = render(
+      <MapCanvas
+        mode="offline"
+        config={mockConfig}
+        offlineReader={null}
+        backendService={null}
+        markers={[]}
+        onCursorPosition={onCursorPosition}
+      />
+    );
+
+    const mapDiv = container.querySelector('.map-canvas') as HTMLElement;
+    fireEvent.mouseMove(mapDiv, { clientX: 80, clientY: 120 });
+
+    expect(onCursorPosition).toHaveBeenCalledTimes(1);
+    expect(onCursorPosition.mock.calls[0][0]).toEqual(
+      expect.objectContaining({ x: expect.any(Number), z: expect.any(Number) })
+    );
   });
 });

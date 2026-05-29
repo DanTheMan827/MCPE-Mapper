@@ -1106,27 +1106,33 @@ export class OfflineWorldReader {
     const text = this.textDecoder.decode(data);
 
     if (text.includes('NetherPortal') || text.includes('nether_portal')) {
-      markers.push({
-        id: `nether_portal_${chunkX}_${chunkZ}_${dimension}`,
-        x: chunkX * 16 + 8,
-        y: 64,
-        z: chunkZ * 16 + 8,
-        dimension,
-        type: 'nether_portal',
-        label: 'Nether Portal',
-      });
+      const portalId = `nether_portal_${chunkX}_${chunkZ}_${dimension}`;
+      if (!markers.some(m => m.id === portalId)) {
+        markers.push({
+          id: portalId,
+          x: chunkX * 16 + 8,
+          y: 64,
+          z: chunkZ * 16 + 8,
+          dimension,
+          type: 'nether_portal',
+          label: 'Nether Portal',
+        });
+      }
     }
 
     if (text.includes('EndPortal') || text.includes('end_portal')) {
-      markers.push({
-        id: `end_portal_${chunkX}_${chunkZ}_${dimension}`,
-        x: chunkX * 16 + 8,
-        y: 64,
-        z: chunkZ * 16 + 8,
-        dimension,
-        type: 'end_portal',
-        label: 'End Portal',
-      });
+      const endId = `end_portal_${chunkX}_${chunkZ}_${dimension}`;
+      if (!markers.some(m => m.id === endId)) {
+        markers.push({
+          id: endId,
+          x: chunkX * 16 + 8,
+          y: 64,
+          z: chunkZ * 16 + 8,
+          dimension,
+          type: 'end_portal',
+          label: 'End Portal',
+        });
+      }
     }
   }
 
