@@ -65,6 +65,18 @@ function buildSubchunkKey(chunkX: number, chunkZ: number, sy: number): Uint8Arra
   return key;
 }
 
+function buildBlockEntityKey(chunkX: number, chunkZ: number, extraByte?: number): Uint8Array {
+  const key = new Uint8Array(extraByte === undefined ? 9 : 10);
+  const view = new DataView(key.buffer);
+  view.setInt32(0, chunkX, true);
+  view.setInt32(4, chunkZ, true);
+  key[8] = 0x31; // tag = BlockEntity
+  if (extraByte !== undefined) {
+    key[9] = extraByte & 0xff;
+  }
+  return key;
+}
+
 function keyToHex(key: Uint8Array): string {
   return Array.from(key)
     .map(b => b.toString(16).padStart(2, '0'))
@@ -259,6 +271,26 @@ describe('OfflineWorldReader', () => {
       const result = r.getBlockFromSubchunk(data, 0, 0, 0);
       // Either null (bounds check) or a wrong block name — definitely NOT 'minecraft:grass'
       expect(result).not.toBe('minecraft:grass');
+    });
+  });
+
+  describe('portal marker deduplication', () => {
+    it('does not duplicate portal markers when block entity records exist with 9-byte and 10-byte keys', () => {
+      const reader = new OfflineWorldReader();
+      const r = reader as any;
+
+      const chunkX = 12;
+      const chunkZ = -3;
+      const portalData = new TextEncoder().encode('nether_portal');
+
+      r.parsedKeys.set(keyToHex(buildBlockEntityKey(chunkX, chunkZ)), portalData);
+      r.parsedKeys.set(keyToHex(buildBlockEntityKey(chunkX, chunkZ, 4)), portalData);
+
+      const markers = reader.getMarkers();
+      const portalMarkers = markers.filter(m => m.type === 'nether_portal');
+
+      expect(portalMarkers).toHaveLength(1);
+      expect(portalMarkers[0].id).toBe(`nether_portal_${chunkX}_${chunkZ}_0`);
     });
   });
 });
