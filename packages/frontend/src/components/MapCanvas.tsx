@@ -9,7 +9,7 @@ import type { TileRenderRequest, TileRenderResponse } from '../workers/tileWorke
 // ─── constants ────────────────────────────────────────────────────────────────
 
 /** Chunks per tile edge (tile = TILE_SIZE×TILE_SIZE chunks = 256×256 blocks) */
-const TILE_SIZE = 16;
+const TILE_SIZE = 4;
 const CHUNK_SIZE = 16;
 /** Pixel dimensions of one rendered tile canvas */
 const TILE_PIXEL_SIZE = TILE_SIZE * CHUNK_SIZE;
