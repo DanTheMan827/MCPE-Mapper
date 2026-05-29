@@ -1017,6 +1017,18 @@ export class OfflineWorldReader {
     // Look for portal blocks and banners in block entity data
     for (const [keyHex, value] of this.parsedKeys) {
       const key = this.hexToBytes(keyHex);
+
+      // Check for 'portals' key containing PortalRecords
+      try {
+        const keyStr = new TextDecoder().decode(key);
+        if (keyStr === 'portals') {
+          this.extractPortalRecords(value, markers);
+          continue;
+        }
+      } catch {
+        // Not a text key
+      }
+
       if (key.length < 9) continue;
 
       // Check block entity data (tag 49 = BlockEntity)
@@ -1158,6 +1170,45 @@ export class OfflineWorldReader {
           label: 'End Portal',
         });
       }
+    }
+  }
+
+  private extractPortalRecords(data: Uint8Array, markers: MapMarker[]): void {
+    // The 'portals' key contains NBT: { data: { PortalRecords: [ { DimId, TpX, TpY, TpZ, Span, Xa, Za }, ... ] } }
+    try {
+      if (data.length < 3 || data[0] !== 10) return;
+      const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const result = this.readNBTCompound(view, 0, data);
+      if (!result) return;
+
+      const dataTag = result.value['data'] as Record<string, unknown> | undefined;
+      if (!dataTag) return;
+
+      const records = dataTag['PortalRecords'] as Array<Record<string, unknown>> | undefined;
+      if (!records || !Array.isArray(records)) return;
+
+      for (let i = 0; i < records.length; i++) {
+        const record = records[i];
+        const dimId = (record['DimId'] as number) ?? 0;
+        const tpX = (record['TpX'] as number) ?? 0;
+        const tpY = (record['TpY'] as number) ?? 0;
+        const tpZ = (record['TpZ'] as number) ?? 0;
+
+        const portalId = `portal_record_${i}_${tpX}_${tpY}_${tpZ}_${dimId}`;
+        if (!markers.some(m => m.id === portalId)) {
+          markers.push({
+            id: portalId,
+            x: tpX,
+            y: tpY,
+            z: tpZ,
+            dimension: dimId,
+            type: 'nether_portal',
+            label: 'Nether Portal',
+          });
+        }
+      }
+    } catch {
+      // Parse error - skip
     }
   }
 

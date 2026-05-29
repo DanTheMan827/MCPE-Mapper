@@ -29,7 +29,7 @@ interface MapCanvasProps {
   backendService: BackendService | null;
   markers: MapMarker[];
   onCursorPosition?: (pos: { x: number; z: number } | null) => void;
-  navigateTo?: { x: number; z: number; dimension: number } | null;
+  navigateTo?: { x: number; z: number; dimension: number; ts: number } | null;
 }
 
 interface WorkerEntry {
