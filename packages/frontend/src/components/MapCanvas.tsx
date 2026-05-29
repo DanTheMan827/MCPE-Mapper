@@ -381,6 +381,13 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
       if (width === 0 || height === 0) return;
 
       const { dimension, heightRange } = configRef.current;
+
+      // Cancel all in-flight work and clear the job queue so tiles are
+      // re-queued with priority based on the current viewport center.
+      loadGeneration.current++;
+      jobQueue.current = [];
+      pendingTileKeys.current.clear();
+
       const generation = loadGeneration.current;
 
       // ── compute visible tile range ────────────────────────────────────────
