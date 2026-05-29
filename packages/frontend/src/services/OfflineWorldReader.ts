@@ -17,6 +17,7 @@ export class OfflineWorldReader {
   private dbParsed = false;
   /** Index mapping "chunkX,chunkZ,dimension" to set of subchunk key hex strings */
   private chunkIndex: Map<string, Set<string>> = new Map();
+  private readonly textDecoder = new TextDecoder('utf-8', { fatal: false });
 
   async loadFile(file: File): Promise<WorldInfo> {
     this.zip = await JSZip.loadAsync(file);
@@ -1102,7 +1103,7 @@ export class OfflineWorldReader {
 
   private extractPortalMarkers(data: Uint8Array, chunkX: number, chunkZ: number, dimension: number, markers: MapMarker[]): void {
     // Look for nether portal or end portal blocks in block entity data
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(data);
+    const text = this.textDecoder.decode(data);
 
     if (text.includes('NetherPortal') || text.includes('nether_portal')) {
       markers.push({
@@ -1132,7 +1133,7 @@ export class OfflineWorldReader {
   private extractPortalFromSubchunk(data: Uint8Array, chunkX: number, chunkZ: number, dimension: number, markers: MapMarker[]): void {
     // Quick text scan of subchunk palette for portal block names
     // Bedrock nether portals use 'minecraft:portal', end portals use 'minecraft:end_portal'
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(data);
+    const text = this.textDecoder.decode(data);
 
     const hasEndPortal = text.includes('minecraft:end_portal');
     // Check for nether portal: 'minecraft:portal' but not as part of 'minecraft:end_portal'
@@ -1214,7 +1215,7 @@ export class OfflineWorldReader {
 
   private extractBannerMarkers(data: Uint8Array, chunkX: number, chunkZ: number, dimension: number, markers: MapMarker[]): void {
     // Banners have id == "Banner" in their block entity NBT
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(data);
+    const text = this.textDecoder.decode(data);
     if (!text.includes('Banner')) return;
 
     try {
