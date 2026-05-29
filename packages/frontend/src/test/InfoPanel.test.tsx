@@ -48,8 +48,8 @@ describe('InfoPanel', () => {
     expect(screen.getByText('The End')).toBeInTheDocument();
   });
 
-  it('displays height range', () => {
-    render(<InfoPanel worldInfo={mockWorldInfo} config={mockConfig} />);
-    expect(screen.getByText('-64 → 320')).toBeInTheDocument();
+  it('displays cursor position when provided', () => {
+    render(<InfoPanel worldInfo={mockWorldInfo} config={mockConfig} cursorPosition={{ x: 42, z: -100 }} />);
+    expect(screen.getByText('42, -100')).toBeInTheDocument();
   });
 });

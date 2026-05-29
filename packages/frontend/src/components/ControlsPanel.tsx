@@ -1,18 +1,28 @@
 import React, { useState } from 'react';
-import { ViewerConfig, WorldInfo } from '@mcpe-mapper/shared';
+import { ViewerConfig, WorldInfo, MapMarker } from '@mcpe-mapper/shared';
 
 interface ControlsPanelProps {
   config: ViewerConfig;
   features: { portals: boolean; players: boolean };
   worldInfo: WorldInfo | null;
   onChange: (config: Partial<ViewerConfig>) => void;
+  playerMarkers?: MapMarker[];
+  onPlayerNavigate?: (marker: MapMarker) => void;
 }
+
+const DIMENSION_NAMES: Record<number, string> = {
+  0: 'Overworld',
+  1: 'Nether',
+  2: 'The End',
+};
 
 export const ControlsPanel: React.FC<ControlsPanelProps> = ({
   config,
   features,
   worldInfo,
   onChange,
+  playerMarkers,
+  onPlayerNavigate,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
 
@@ -127,6 +137,29 @@ export const ControlsPanel: React.FC<ControlsPanelProps> = ({
             </label>
           )}
         </div>
+
+        {playerMarkers && playerMarkers.length > 0 && (
+          <div className="control-group">
+            <h3>Players</h3>
+            <div className="player-list">
+              {playerMarkers.map(marker => (
+                <button
+                  key={marker.id}
+                  className="player-list-item"
+                  onClick={() => onPlayerNavigate?.(marker)}
+                >
+                  <span className="player-name">{marker.label}</span>
+                  <span className="player-coords">
+                    {Math.floor(marker.x)}, {Math.floor(marker.y)}, {Math.floor(marker.z)}
+                  </span>
+                  <span className="player-dimension">
+                    {DIMENSION_NAMES[marker.dimension] || `Dim ${marker.dimension}`}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </>
   );

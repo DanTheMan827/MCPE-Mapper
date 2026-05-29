@@ -1056,53 +1056,32 @@ export class OfflineWorldReader {
       if (data.length < 3 || data[0] !== 10) return null;
       const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
 
-      let offset = 1;
-      const rootNameLen = view.getInt16(offset, true);
-      offset += 2 + rootNameLen;
+      // Use full NBT parser to avoid picking up nested Name tags from inventory items
+      const result = this.readNBTCompound(view, 0, data);
+      if (!result) return null;
 
-      let x = 0, y = 0, z = 0, dimension = 0;
-      let foundPos = false;
+      const compound = result.value;
+      const pos = compound['Pos'] as number[] | undefined;
+      if (!pos || pos.length < 3) return null;
+
+      const x = pos[0];
+      const y = pos[1];
+      const z = pos[2];
+      const dimension = (compound['DimensionId'] as number) ?? 0;
+
+      // Try NameTag first (most reliable for player display name), then fall back
       let name: string | undefined;
-
-      while (offset < data.length) {
-        const tagType = data[offset]; offset++;
-        if (tagType === 0) break;
-
-        const nameLen = view.getInt16(offset, true); offset += 2;
-        const tagName = new TextDecoder().decode(data.slice(offset, offset + nameLen));
-        offset += nameLen;
-
-        if (tagType === 9 && tagName === 'Pos') {
-          // List of floats
-          const listType = data[offset]; offset++;
-          const listLen = view.getInt32(offset, true); offset += 4;
-          if (listType === 5 && listLen === 3) {
-            x = view.getFloat32(offset, true); offset += 4;
-            y = view.getFloat32(offset, true); offset += 4;
-            z = view.getFloat32(offset, true); offset += 4;
-            foundPos = true;
-          } else {
-            for (let i = 0; i < listLen; i++) {
-              const skip = this.skipNBTPayload(listType, data, offset);
-              if (skip < 0) return null;
-              offset += skip;
-            }
-          }
-        } else if (tagType === 3 && tagName === 'DimensionId') {
-          dimension = view.getInt32(offset, true); offset += 4;
-        } else if (tagType === 8 && (tagName === 'NameTag' || tagName === 'Username' || tagName === 'Name')) {
-          const strLen = view.getInt16(offset, true); offset += 2;
-          const candidate = new TextDecoder().decode(data.slice(offset, offset + strLen));
-          offset += strLen;
-          if (!name && candidate.length > 0) name = candidate;
-        } else {
-          const skip = this.skipNBTPayload(tagType, data, offset);
-          if (skip < 0) return null;
-          offset += skip;
+      const nameTag = compound['NameTag'] as string | undefined;
+      if (nameTag && nameTag.length > 0) {
+        name = nameTag;
+      } else {
+        const username = compound['Username'] as string | undefined;
+        if (username && username.length > 0) {
+          name = username;
         }
       }
 
-      if (foundPos) return { x, y, z, dimension, name };
+      return { x, y, z, dimension, name };
     } catch {
       // Parse error
     }
@@ -1140,35 +1119,45 @@ export class OfflineWorldReader {
 
   private extractPortalFromSubchunk(data: Uint8Array, chunkX: number, chunkZ: number, dimension: number, markers: MapMarker[]): void {
     // Quick text scan of subchunk palette for portal block names
-    // Nether portals use 'minecraft:portal', end portals use 'minecraft:end_portal'
+    // Bedrock nether portals use 'minecraft:portal', end portals use 'minecraft:end_portal'
     const text = new TextDecoder('utf-8', { fatal: false }).decode(data);
 
-    const portalId = `nether_portal_${chunkX}_${chunkZ}_${dimension}`;
-    if ((text.includes('minecraft:portal') || text.includes('minecraft:nether_portal')) &&
-        !markers.some(m => m.id === portalId)) {
-      markers.push({
-        id: portalId,
-        x: chunkX * 16 + 8,
-        y: 64,
-        z: chunkZ * 16 + 8,
-        dimension,
-        type: 'nether_portal',
-        label: 'Nether Portal',
-      });
+    const hasEndPortal = text.includes('minecraft:end_portal');
+    // Check for nether portal: 'minecraft:portal' but not as part of 'minecraft:end_portal'
+    const hasNetherPortal = text.includes('minecraft:portal') && (
+      text.includes('minecraft:nether_portal') ||
+      // Ensure 'minecraft:portal' is not just from 'minecraft:end_portal'
+      text.replace(/minecraft:end_portal/g, '').includes('minecraft:portal')
+    );
+
+    if (hasNetherPortal) {
+      const portalId = `nether_portal_${chunkX}_${chunkZ}_${dimension}`;
+      if (!markers.some(m => m.id === portalId)) {
+        markers.push({
+          id: portalId,
+          x: chunkX * 16 + 8,
+          y: 64,
+          z: chunkZ * 16 + 8,
+          dimension,
+          type: 'nether_portal',
+          label: 'Nether Portal',
+        });
+      }
     }
 
-    const endId = `end_portal_${chunkX}_${chunkZ}_${dimension}`;
-    if (text.includes('minecraft:end_portal') &&
-        !markers.some(m => m.id === endId)) {
-      markers.push({
-        id: endId,
-        x: chunkX * 16 + 8,
-        y: 64,
-        z: chunkZ * 16 + 8,
-        dimension,
-        type: 'end_portal',
-        label: 'End Portal',
-      });
+    if (hasEndPortal) {
+      const endId = `end_portal_${chunkX}_${chunkZ}_${dimension}`;
+      if (!markers.some(m => m.id === endId)) {
+        markers.push({
+          id: endId,
+          x: chunkX * 16 + 8,
+          y: 64,
+          z: chunkZ * 16 + 8,
+          dimension,
+          type: 'end_portal',
+          label: 'End Portal',
+        });
+      }
     }
   }
 
