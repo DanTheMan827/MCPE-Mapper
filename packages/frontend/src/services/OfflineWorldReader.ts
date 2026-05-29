@@ -1041,6 +1041,11 @@ export class OfflineWorldReader {
         this.extractPortalMarkers(value, kx, kz, dim, markers);
         this.extractBannerMarkers(value, kx, kz, dim, markers);
       }
+
+      // Tag 47 (0x2f) = SubChunkPrefix - scan palette for portal blocks
+      if (tag === 0x2f) {
+        this.extractPortalFromSubchunk(value, kx, kz, dim, markers);
+      }
     }
 
     return markers;
@@ -1085,11 +1090,11 @@ export class OfflineWorldReader {
           }
         } else if (tagType === 3 && tagName === 'DimensionId') {
           dimension = view.getInt32(offset, true); offset += 4;
-        } else if (tagType === 8 && (tagName === 'Username' || tagName === 'Name')) {
+        } else if (tagType === 8 && (tagName === 'NameTag' || tagName === 'Username' || tagName === 'Name')) {
           const strLen = view.getInt16(offset, true); offset += 2;
           const candidate = new TextDecoder().decode(data.slice(offset, offset + strLen));
           offset += strLen;
-          if (!name) name = candidate;
+          if (!name && candidate.length > 0) name = candidate;
         } else {
           const skip = this.skipNBTPayload(tagType, data, offset);
           if (skip < 0) return null;
@@ -1132,6 +1137,41 @@ export class OfflineWorldReader {
       });
     }
   }
+
+  private extractPortalFromSubchunk(data: Uint8Array, chunkX: number, chunkZ: number, dimension: number, markers: MapMarker[]): void {
+    // Quick text scan of subchunk palette for portal block names
+    // Nether portals use 'minecraft:portal', end portals use 'minecraft:end_portal'
+    const text = new TextDecoder('utf-8', { fatal: false }).decode(data);
+
+    const portalId = `nether_portal_${chunkX}_${chunkZ}_${dimension}`;
+    if ((text.includes('minecraft:portal') || text.includes('minecraft:nether_portal')) &&
+        !markers.some(m => m.id === portalId)) {
+      markers.push({
+        id: portalId,
+        x: chunkX * 16 + 8,
+        y: 64,
+        z: chunkZ * 16 + 8,
+        dimension,
+        type: 'nether_portal',
+        label: 'Nether Portal',
+      });
+    }
+
+    const endId = `end_portal_${chunkX}_${chunkZ}_${dimension}`;
+    if (text.includes('minecraft:end_portal') &&
+        !markers.some(m => m.id === endId)) {
+      markers.push({
+        id: endId,
+        x: chunkX * 16 + 8,
+        y: 64,
+        z: chunkZ * 16 + 8,
+        dimension,
+        type: 'end_portal',
+        label: 'End Portal',
+      });
+    }
+  }
+
   private extractBannerMarkers(data: Uint8Array, chunkX: number, chunkZ: number, dimension: number, markers: MapMarker[]): void {
     // Banners have id == "Banner" in their block entity NBT
     const text = new TextDecoder('utf-8', { fatal: false }).decode(data);

@@ -199,8 +199,11 @@ export const MapCanvas: React.FC<MapCanvasProps> = ({
 
   /** Remove all tile canvases from DOM but keep them in the dimension cache */
   const clearDom = useCallback(() => {
-    for (const canvas of visibleCanvases.current.values()) {
-      canvas.remove();
+    const layer = chunkLayerRef.current;
+    if (layer) {
+      while (layer.firstChild) {
+        layer.removeChild(layer.firstChild);
+      }
     }
     visibleCanvases.current.clear();
   }, []);
